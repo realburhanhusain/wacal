@@ -185,12 +185,15 @@ def main() -> int:
         message = Inbound(from_phone=me, text=line, message_id=f"sim.{counter}",
                           profile_name=profile.get(me, ""), is_tap=False)
         # Same path the webhook uses: a typed number stands in for a tap.
-        message = numbering.resolve(conn, message)
+        # Same scoping the webhook uses: one list per conversation, so two
+        # hosts cannot share a numbered menu.
+        scope = host["slug"] if host else numbering.PEER_SCOPE
+        message = numbering.resolve(conn, message, scope)
         if host is not None:
             outcome = handle_business(conn, db.get_host(conn, host["slug"]), message)
         else:
             outcome = handle(conn, message)
-        numbering.remember(conn, message.from_phone, outcome.reply)
+        numbering.remember(conn, message.from_phone, scope, outcome.reply)
 
         show(profile.get(me, me), outcome.reply)
         for phone, note in outcome.notify:
