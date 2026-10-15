@@ -252,8 +252,27 @@ def test_business_booking_is_mirrored_to_google(conn, host, fake_google):
 def test_stale_service_index_is_handled(conn, host):
     db.update_host(conn, "dr-sharma", services=json.dumps([]))
     reloaded = db.get_host(conn, "dr-sharma")
-    out = send(conn, reloaded, "b:svc:3", tap=True)
+    out = send(conn, reloaded, "b:svc:3:abcd", tap=True)
     assert "no longer offered" in out.reply.text
+
+
+def test_an_edited_menu_invalidates_a_saved_confirm_button(conn, host):
+    """The service fingerprint in the id must outrank the menu position."""
+    service = send(conn, host, "hi").reply.rows[0]
+    dates = send(conn, host, service.id, tap=True)
+    slots = send(conn, host, dates.reply.rows[0].id, tap=True)
+    summary = send(conn, host, slots.reply.rows[0].id, tap=True)
+    assert "Consultation" in summary.reply.text
+    confirm_id = summary.reply.rows[0].id
+
+    # The admin reorders the menu; position 0 is now a different service.
+    db.update_host(conn, "dr-sharma", services=json.dumps(
+        [{"name": "Vaccination", "duration_mins": 30, "price": 90},
+         *SERVICES]))
+    out = send(conn, db.get_host(conn, "dr-sharma"), confirm_id, tap=True)
+    assert "no longer offered" in out.reply.text
+    assert conn.execute(
+        "SELECT count(*) AS n FROM events").fetchone()["n"] == 0
 
 
 def test_unreadable_tap_payloads_do_not_crash(conn, host):

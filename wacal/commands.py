@@ -14,12 +14,16 @@ from datetime import date, datetime, timedelta, timezone
 from . import busy, db, gcal, keywords
 from .gcal import ExternalCalendarError, NotConfigured
 from .slots import (
+    ambiguous_day,
     fmt_dt,
     fmt_slot,
+    local_date,
     mutual_free_slots,
     parse_day,
     parse_hhmm,
+    schedule_for,
     tz_of,
+    work_window,
 )
 from .whatsapp import Inbound, Reply, Row
 
@@ -30,6 +34,7 @@ HELP = (
     "Commands:\n"
     "• free <name|phone> [today|tomorrow|mon|YYYY-MM-DD] — see open slots and book one\n"
     "• block <day> <HH:MM-HH:MM> [title] — block your own time\n"
+    "• closed <day> — block a whole working day, holidays included\n"
     "• my — your upcoming bookings with their refs\n"
     "• cancel <ref> — unblock a slot\n"
     "• share <phone> — let someone see your free/busy and book you\n"
@@ -39,6 +44,15 @@ HELP = (
     "• name <your name> / tz <Area/City> / hours 09:00-17:00 / days mon-fri\n"
     "• me — your settings"
 )
+
+# Words that must never be mistaken for somebody's name.
+KNOWN_VERBS = {
+    "help", "book", "me", "name", "register", "tz", "timezone", "hours",
+    "days", "share", "unshare", "shared", "free", "slots", "availability",
+    "block", "closed", "my", "mine", "bookings", "cancel", "unblock",
+    "connect", "disconnect", "mylink", "link", "reschedule", "change",
+    "yes", "no",
+}
 
 CALENDAR_UNREACHABLE = (
     "Cannot read {name}'s connected Google Calendar right now, so I will not "
@@ -56,30 +70,41 @@ def text(body: str) -> Outcome:
     return Outcome(Reply(text=body))
 
 
-def ensure_user(conn, msg: Inbound, *, welcome: str = ""):
+def ensure_user(conn, msg: Inbound, *, welcome: str = "", tz: str = "UTC"):
     """Resolve the sender to a user row, registering them if needed.
 
     Returns (user, outcome). A non-None outcome is the reply to send instead of
-    continuing -- either a request for their name, or a welcome.
+    continuing -- a request for their name.
+
+    tz is the timezone a newly created user starts in. Business mode passes the
+    host's, because every reply renders in the viewer's timezone and a customer
+    who has never heard of this app cannot be asked to set one first.
     """
     user = db.get_user_by_phone(conn, msg.from_phone)
     if user is not None:
         return user, None
 
     if msg.profile_name:
-        return db.create_user(conn, msg.from_phone, msg.profile_name), None
+        return db.create_user(conn, msg.from_phone, msg.profile_name, tz), None
 
     lowered = msg.text.lower()
     for prefix in ("name ", "register ", "i am ", "im "):
         if lowered.startswith(prefix):
             chosen = msg.text[len(prefix):].strip()
             if chosen:
-                user = db.create_user(conn, msg.from_phone, chosen)
-                return user, text(
-                    f"Registered as {user['display_name']}.\n"
-                    + (welcome or f"Set your timezone next: tz Asia/Riyadh\n\n{HELP}")
-                )
+                return db.create_user(conn, msg.from_phone, chosen, tz), None
             break
+    else:
+        # A bare "Ravi" is the obvious answer to "what name should people
+        # see?", so accept it. Without this the prompt repeated forever. A
+        # known verb or alias is never mistaken for a name.
+        candidate = " ".join(msg.text.split())
+        first = candidate.split()[0].lower() if candidate else ""
+        if (candidate and len(candidate) <= 40
+                and keywords.canonical(candidate) is None
+                and first not in KNOWN_VERBS):
+            return db.create_user(conn, msg.from_phone, candidate, tz), None
+
     return None, text(
         "Welcome. What name should people see?\nReply: name Burhan"
     )
@@ -87,9 +112,19 @@ def ensure_user(conn, msg: Inbound, *, welcome: str = ""):
 
 def handle(conn, msg: Inbound, *, now: datetime | None = None) -> Outcome:
     now = now or db.now_utc()
+    existing = db.get_user_by_phone(conn, msg.from_phone) is not None
     user, early = ensure_user(conn, msg)
     if early is not None:
         return early
+    if not existing:
+        # A newly created user is told which timezone their times are in.
+        # Meta always supplies a profile name, so auto-registered peer users
+        # never saw this hint and silently lived in UTC.
+        return text(
+            f"Welcome {user['display_name']}.\n"
+            f"Times are shown in {user['timezone']} — change it with: "
+            f"tz Asia/Riyadh\n\n{HELP}"
+        )
 
     raw = msg.text.strip()
     if not raw:
@@ -131,6 +166,8 @@ def handle(conn, msg: Inbound, *, now: datetime | None = None) -> Outcome:
         return _do_free(conn, user, rest, now)
     if verb == "block":
         return _do_block(conn, user, rest, now)
+    if verb == "closed":
+        return _do_closed(conn, user, rest, now)
     if verb == "my":
         return _do_my(conn, user, now)
     if verb in ("cancel", "unblock"):
@@ -168,10 +205,13 @@ def _do_me(conn, user) -> Outcome:
 
 
 def _do_connect(conn, user) -> Outcome:
+    nonce = gcal.new_nonce()
     try:
-        url = gcal.auth_url(gcal.sign_state(user["id"]))
+        url = gcal.auth_url(gcal.sign_state(user["id"], nonce))
     except NotConfigured as exc:
         return text(f"Google Calendar is not set up on this server. {exc}")
+    # Recorded so the callback can spend it once and only once.
+    db.create_oauth_state(conn, nonce, user["id"])
     return text(
         "Open this link within 15 minutes and allow access. Your Google "
         "Calendar events will then block slots here, and bookings made here "
@@ -316,6 +356,10 @@ def _do_free(conn, user, rest, now) -> Outcome:
         return text("Usage: free <name|phone> [today|tomorrow|YYYY-MM-DD]")
 
     parts = rest.split()
+    # "free tomorrow" is a question about your own calendar. Without this the
+    # day word is looked up as a person: "nobody here matches tomorrow".
+    if len(parts) == 1 and parse_day(parts[0], today=_local_today(user, now)):
+        parts = [user["phone"], parts[0]]
     requested_day = None
     if len(parts) > 1:
         requested_day = parse_day(parts[-1], today=_local_today(user, now))
@@ -339,9 +383,13 @@ def _do_free(conn, user, rest, now) -> Outcome:
     found: list[tuple[datetime, datetime]] = []
     day_used = first_day
     try:
+        # One read of both calendars for the whole lookahead, not one per day.
+        prefetched = prefetch_busy(conn, owner, user, first_day,
+                                   first_day + timedelta(days=span))
         for offset in range(span):
             day_used = first_day + timedelta(days=offset)
-            found = _slots_on(conn, owner, user, day_used, now)
+            found = _slots_on(conn, owner, user, day_used, now,
+                              prefetched=prefetched)
             if found:
                 break
     except ExternalCalendarError:
@@ -358,11 +406,16 @@ def _do_free(conn, user, rest, now) -> Outcome:
             f"({user['timezone']}). You have view-only access."
         )
 
+    # On a DST fall-back day two slots share a wall-clock label, so show the
+    # offset. The date comes from the viewer's timezone, not the owner's: the
+    # owner's Friday slot can be the viewer's Thursday.
+    offsets = ambiguous_day(found[:10], user["timezone"])
     rows = [
         Row(
             id=f"book:{owner['id']}:{int(start.timestamp())}",
-            title=fmt_slot(start, end, user["timezone"]),
-            description=f"{day_used:%a %d %b} · {user['timezone']}",
+            title=fmt_slot(start, end, user["timezone"], show_offset=offsets),
+            description=f"{local_date(start, user['timezone']):%a %d %b}"
+                        f" · {user['timezone']}",
         )
         for start, end in found[:10]
     ]
@@ -380,14 +433,45 @@ def _do_free(conn, user, rest, now) -> Outcome:
     )
 
 
+def prefetch_busy(conn, owner, requester, first_day: date, last_day: date,
+                  *, mutual: bool = True):
+    """Both parties' busy intervals for a whole date range, in one pass.
+
+    Scanning day by day meant one Google round trip per candidate day -- up to
+    60 for a single "pick a service" tap, serially, while holding the lock.
+    """
+    start = datetime.combine(first_day, datetime.min.time(),
+                             tzinfo=timezone.utc) - timedelta(days=1)
+    end = datetime.combine(last_day, datetime.min.time(),
+                           tzinfo=timezone.utc) + timedelta(days=2)
+    owner_busy = busy.busy_for(conn, owner["id"], start, end)
+    if not mutual or owner["id"] == requester["id"]:
+        return owner_busy, owner_busy
+    return owner_busy, busy.busy_for(conn, requester["id"], start, end)
+
+
 def _slots_on(conn, owner, requester, day: date, now: datetime,
               *, slot_minutes: int | None = None, mutual: bool = True,
-              requester_hours: bool = True):
+              requester_hours: bool = True, prefetched=None):
     """Free slots on one day, across both people and both calendar sources.
 
     Raises ExternalCalendarError when a connected Google Calendar cannot be
     read. Callers must pass that on to the user instead of offering slots.
+
+    prefetched is an (owner_busy, requester_busy) pair covering at least this
+    day; pass it when looping over days so the calendars are read once.
     """
+    if prefetched is not None:
+        owner_busy, requester_busy = prefetched
+        effective_requester = (
+            owner if (not mutual or owner["id"] == requester["id"]) else requester
+        )
+        return mutual_free_slots(
+            owner, owner_busy, effective_requester, requester_busy, day,
+            now=now, slot_minutes=slot_minutes,
+            requester_hours=requester_hours,
+        )
+
     pad_start = datetime.combine(day, datetime.min.time(),
                                  tzinfo=timezone.utc) - timedelta(days=1)
     pad_end = pad_start + timedelta(days=3)
@@ -517,6 +601,51 @@ def _do_block(conn, user, rest, now) -> Outcome:
         f"Blocked {fmt_dt(start, user['timezone'])}-"
         f"{end.astimezone(zone):%H:%M} — {title}\n"
         f"Ref {event['ref']} · unblock with: cancel {event['ref']}{mirror_note}"
+    )
+
+
+def _do_closed(conn, user, rest, now) -> Outcome:
+    """Block a whole working day. The holiday command.
+
+    Marking a clinic closed used to need an admin PATCH of working_days, which
+    no business owner is going to do. One public holiday without this and the
+    page takes bookings on a day nobody is there.
+    """
+    if not rest:
+        return text("Usage: closed tomorrow   or   closed 2026-12-25")
+    day = parse_day(rest.split()[0], today=_local_today(user, now))
+    if day is None:
+        return text(f"Could not read the day {rest.split()[0]!r}.")
+    reason = " ".join(rest.split()[1:]) or "Closed"
+
+    # Cover the user's own hours and every host they own, since one WhatsApp
+    # number can run several booking pages with different windows.
+    schedules = [schedule_for(user)]
+    hosts = db.hosts_of(conn, user["id"])
+    schedules += [schedule_for(user, host) for host in hosts]
+    windows = [w for w in (work_window(s, day) for s in schedules) if w]
+    if not windows:
+        return text(f"{day:%a %d %b} is already outside your working days.")
+
+    start = min(w[0] for w in windows)
+    end = max(w[1] for w in windows)
+    existing = db.busy_intervals(conn, user["id"], start, end)
+    if existing:
+        return text(
+            f"{day:%a %d %b} already has {len(existing)} booking(s). "
+            f"Cancel them first with: my"
+        )
+    try:
+        event = db.create_event(conn, user["id"], user["id"], start, end, reason)
+    except db.SlotTaken:
+        return text(f"{day:%a %d %b} is already blocked.")
+    mirror_note = _mirror(conn, user, event, description="Closed via WhatsApp")
+    zone = user["timezone"]
+    return text(
+        f"Closed {day:%a %d %b} — {start.astimezone(tz_of(zone)):%H:%M} to "
+        f"{end.astimezone(tz_of(zone)):%H:%M} ({zone}) is now blocked across "
+        f"{len(windows)} schedule(s).\n"
+        f"Ref {event['ref']} · reopen with: cancel {event['ref']}{mirror_note}"
     )
 
 

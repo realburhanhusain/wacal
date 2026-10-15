@@ -19,7 +19,7 @@ def client(monkeypatch):
     monkeypatch.setattr(main, "VERIFY_TOKEN", "tok")
     main.app.state.conn = db.connect(":memory:")
     main.app.state.transport = MemoryTransport()
-    db.create_user(main.app.state.conn, "966500000002", "Ahmed", "Asia/Riyadh")
+    db.create_user(main.app.state.conn, "+966500000002", "Ahmed", "Asia/Riyadh")
     with TestClient(main.app) as test_client:
         yield test_client
     main.app.state.conn.close()
@@ -62,7 +62,9 @@ def test_unsigned_request_is_rejected(client):
 def test_signed_message_gets_a_reply(client):
     assert post(client, message_body("help")).status_code == 200
     to, reply = main.app.state.transport.sent[0]
-    assert to == "966500000002"
+    # Meta's wa_id has no "+"; it is normalised so the same person is one user
+    # row whichever transport they arrive on.
+    assert to == "+966500000002"
     assert "free <name|phone>" in reply.text
 
 

@@ -184,12 +184,12 @@ def test_unknown_host_webhook_answers_without_booking(client):
     assert "not active" in reply.text
 
 
-def test_host_status_endpoint(client):
+def test_host_status_endpoint_discloses_nothing(client):
     admin(client, "POST", "/dashboard/register", json=HOST_BODY)
     body = client.get("/webhook/dr-sharma/status").json()
-    assert body["services"] == 2
-    assert body["google_calendar_connected"] is False
-    assert body["timezone"] == "Asia/Riyadh"
+    # Unauthenticated, so it must not leak the business name, timezone or
+    # whether a calendar is connected. The full view needs the admin key.
+    assert body == {"slug": "dr-sharma", "active": True}
     assert client.get("/webhook/ghost/status").status_code == 404
 
 
@@ -240,7 +240,9 @@ def test_oauth_callback_stores_the_link(client, monkeypatch):
     user = db.create_user(conn, "+966500000001", "Burhan", "Asia/Riyadh")
     monkeypatch.setattr(gcal, "exchange_code",
                         lambda code: ('{"token": "t"}', "burhan@example.com"))
-    state = gcal.sign_state(user["id"])
+    nonce = gcal.new_nonce()
+    db.create_oauth_state(conn, nonce, user["id"])
+    state = gcal.sign_state(user["id"], nonce)
 
     response = client.get("/auth/google/callback",
                           params={"state": state, "code": "auth-code"})

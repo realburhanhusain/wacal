@@ -138,14 +138,14 @@ def test_connect_without_client_secrets_is_explicit(conn, people, monkeypatch):
 
 def test_state_token_round_trip(monkeypatch):
     monkeypatch.setenv("WACAL_STATE_SECRET", "s3cret")
-    token = gcal.sign_state(42)
-    assert gcal.verify_state(token) == 42
+    token = gcal.sign_state(42, "nonce-1")
+    assert gcal.verify_state(token) == (42, "nonce-1")
 
 
 def test_tampered_state_is_rejected(monkeypatch):
     monkeypatch.setenv("WACAL_STATE_SECRET", "s3cret")
-    token = gcal.sign_state(42)
-    forged = gcal.sign_state(43)
+    token = gcal.sign_state(42, "nonce-1")
+    forged = gcal.sign_state(43, "nonce-2")
     # Same secret, different user: swapping the body invalidates the signature.
     mixed = forged[: len(forged) // 2] + token[len(token) // 2:]
     with pytest.raises(ValueError):
@@ -154,7 +154,7 @@ def test_tampered_state_is_rejected(monkeypatch):
 
 def test_state_from_another_secret_is_rejected(monkeypatch):
     monkeypatch.setenv("WACAL_STATE_SECRET", "secret-a")
-    token = gcal.sign_state(42)
+    token = gcal.sign_state(42, "nonce-1")
     monkeypatch.setenv("WACAL_STATE_SECRET", "secret-b")
     with pytest.raises(ValueError):
         gcal.verify_state(token)
@@ -163,7 +163,7 @@ def test_state_from_another_secret_is_rejected(monkeypatch):
 def test_state_expires(monkeypatch):
     monkeypatch.setenv("WACAL_STATE_SECRET", "s3cret")
     issued = time.time() - gcal.STATE_TTL_SECONDS - 1
-    token = gcal.sign_state(42, now=issued)
+    token = gcal.sign_state(42, "nonce-1", now=issued)
     with pytest.raises(ValueError, match="expired"):
         gcal.verify_state(token)
 

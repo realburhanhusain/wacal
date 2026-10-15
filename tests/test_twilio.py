@@ -146,7 +146,7 @@ def test_typed_number_becomes_the_row_id(conn):
 
     reply = Reply(text="pick", rows=[Row(id="b:svc:0", title="A"),
                                      Row(id="b:svc:1", title="B")])
-    numbering.remember(conn, "+1", reply)
+    numbering.remember(conn, "+1", "peer", reply)
 
     resolved = numbering.resolve(conn, Inbound(from_phone="+1", text="2",
                                                message_id="m1"))
@@ -157,7 +157,7 @@ def test_typed_number_becomes_the_row_id(conn):
 def test_out_of_range_number_keeps_the_list(conn):
     from wacal.whatsapp import Inbound
 
-    numbering.remember(conn, "+1", Reply(text="pick",
+    numbering.remember(conn, "+1", "peer", Reply(text="pick",
                                          rows=[Row(id="b:svc:0", title="A")]))
     first = numbering.resolve(conn, Inbound(from_phone="+1", text="7",
                                             message_id="m1"))
@@ -175,12 +175,12 @@ def test_yes_and_no_map_to_confirm_and_restart(conn):
         Row(id="b:ok:0:1760000000", title="Confirm"),
         Row(id="b:restart:0", title="Start over"),
     ])
-    numbering.remember(conn, "+1", confirm)
+    numbering.remember(conn, "+1", "peer", confirm)
     assert numbering.resolve(conn, Inbound(from_phone="+1", text="YES",
                                            message_id="m1")).text \
         == "b:ok:0:1760000000"
 
-    numbering.remember(conn, "+1", confirm)
+    numbering.remember(conn, "+1", "peer", confirm)
     assert numbering.resolve(conn, Inbound(from_phone="+1", text="नहीं",
                                            message_id="m2")).text \
         == "b:restart:0"
@@ -189,7 +189,7 @@ def test_yes_and_no_map_to_confirm_and_restart(conn):
 def test_yes_without_a_confirm_row_is_left_alone(conn):
     from wacal.whatsapp import Inbound
 
-    numbering.remember(conn, "+1", Reply(text="pick",
+    numbering.remember(conn, "+1", "peer", Reply(text="pick",
                                          rows=[Row(id="b:svc:0", title="A")]))
     assert numbering.resolve(conn, Inbound(from_phone="+1", text="yes",
                                            message_id="m1")).text == "yes"

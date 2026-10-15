@@ -21,6 +21,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import time
 from datetime import datetime, timezone
 
@@ -39,29 +40,51 @@ class NotConfigured(RuntimeError):
     """No client_secrets.json, so the OAuth flow cannot start."""
 
 
+def allow_unsigned() -> bool:
+    """Explicit local-only escape hatch. Never set this on a real deployment."""
+    return os.environ.get("WACAL_ALLOW_UNSIGNED", "").lower() in ("1", "true", "yes")
+
+
 def _state_secret() -> bytes:
-    secret = os.environ.get("WACAL_STATE_SECRET")
+    """The HMAC key for OAuth state tokens.
+
+    There is no default. A hard-coded fallback is published with the source, so
+    anyone could mint a state for any user id, consent with their own Google
+    account, and have it stored against that user -- taking over whose calendar
+    the app reads and writes.
+    """
+    secret = os.environ.get("WACAL_STATE_SECRET") or os.environ.get("WA_APP_SECRET")
     if not secret:
-        # Derived from the app secret when available so restarts keep working.
-        secret = os.environ.get("WA_APP_SECRET") or "dev-state-secret"
+        if allow_unsigned():
+            return b"insecure-local-only"
+        raise NotConfigured(
+            "Set WACAL_STATE_SECRET (or WA_APP_SECRET) before linking a "
+            "calendar. Without it an OAuth state token can be forged."
+        )
     return secret.encode()
 
 
-def sign_state(user_id: int, *, now: float | None = None) -> str:
+def new_nonce() -> str:
+    return secrets.token_urlsafe(12)
+
+
+def sign_state(user_id: int, nonce: str, *, now: float | None = None) -> str:
     """A short-lived, signed token standing in for a login session.
 
     The user gets the OAuth link over WhatsApp, where their phone number has
     already been authenticated by the carrier and by Meta. The token binds that
-    link to one user id for 15 minutes.
+    link to one user id for 15 minutes, and the nonce is recorded in the
+    database so the callback can spend it exactly once.
     """
-    body = f"{user_id}:{int(now or time.time())}".encode()
+    body = f"{user_id}:{int(now or time.time())}:{nonce}".encode()
     mac = hmac.new(_state_secret(), body, hashlib.sha256).digest()[:MAC_BYTES]
     # The MAC is fixed length and split off by position. A delimiter byte would
     # not work: the digest can contain any byte, including the delimiter.
     return base64.urlsafe_b64encode(body + mac).decode().rstrip("=")
 
 
-def verify_state(token: str, *, now: float | None = None) -> int:
+def verify_state(token: str, *, now: float | None = None) -> tuple[int, str]:
+    """Returns (user_id, nonce). Raises ValueError on anything suspect."""
     padded = token + "=" * (-len(token) % 4)
     try:
         raw = base64.urlsafe_b64decode(padded.encode())
@@ -71,13 +94,13 @@ def verify_state(token: str, *, now: float | None = None) -> int:
         expected = hmac.new(_state_secret(), body, hashlib.sha256).digest()[:MAC_BYTES]
         if not hmac.compare_digest(expected, mac):
             raise ValueError("bad signature")
-        user_id_text, _, issued_text = body.decode().partition(":")
+        user_id_text, issued_text, nonce = body.decode().split(":", 2)
         issued = int(issued_text)
     except (ValueError, UnicodeDecodeError) as exc:
         raise ValueError("unreadable state token") from exc
     if (now or time.time()) - issued > STATE_TTL_SECONDS:
         raise ValueError("state token expired")
-    return int(user_id_text)
+    return int(user_id_text), nonce
 
 
 def redirect_uri() -> str:

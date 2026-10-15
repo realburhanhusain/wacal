@@ -17,19 +17,26 @@ from . import db, keywords
 from .whatsapp import Inbound, Reply
 
 SESSION_KIND = "rows"
+PEER_SCOPE = "peer"
 TTL_SECONDS = 3600
 
 
-def remember(conn, phone: str, reply: Reply) -> None:
-    """Store the row ids most recently offered to this number."""
+def remember(conn, phone: str, scope: str, reply: Reply) -> None:
+    """Store the row ids most recently offered to this number in this scope.
+
+    The scope is the host slug, or PEER_SCOPE. Without it one customer with
+    menus open at two businesses shares a single list, and "1" resolves
+    against whichever menu happened to arrive last -- booking the wrong
+    service at the wrong venue.
+    """
     if not reply.rows:
         return
-    db.put_session(conn, phone, SESSION_KIND,
+    db.put_session(conn, phone, scope, SESSION_KIND,
                    json.dumps([row.id for row in reply.rows]),
                    ttl_seconds=TTL_SECONDS)
 
 
-def resolve(conn, msg: Inbound) -> Inbound:
+def resolve(conn, msg: Inbound, scope: str = PEER_SCOPE) -> Inbound:
     """Turn a bare number into the row id it stood for.
 
     Anything else is returned unchanged. An out-of-range number is left alone
@@ -38,10 +45,13 @@ def resolve(conn, msg: Inbound) -> Inbound:
     """
     text = msg.text.strip()
     intent = keywords.canonical(text)
-    if msg.is_tap or not (text.isdigit() or intent in ("yes", "no")):
+    # isdigit() is True for "²" and other non-ASCII digits, which int() then
+    # rejects. Require ASCII so a stray character cannot raise mid-dispatch.
+    numeric = text.isascii() and text.isdigit()
+    if msg.is_tap or not (numeric or intent in ("yes", "no")):
         return msg
 
-    row = db.pop_session(conn, msg.from_phone)
+    row = db.pop_session(conn, msg.from_phone, scope)
     if row is None or row["kind"] != SESSION_KIND:
         return msg
     try:
@@ -51,8 +61,8 @@ def resolve(conn, msg: Inbound) -> Inbound:
 
     def keep() -> Inbound:
         # Put the list back: the rows are still valid, the answer was not.
-        db.put_session(conn, msg.from_phone, SESSION_KIND, row["payload"],
-                       ttl_seconds=TTL_SECONDS)
+        db.put_session(conn, msg.from_phone, scope, SESSION_KIND,
+                       row["payload"], ttl_seconds=TTL_SECONDS)
         return msg
 
     if intent in ("yes", "no"):

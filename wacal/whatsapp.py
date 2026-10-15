@@ -44,9 +44,24 @@ class Reply:
     rows: list[Row] = field(default_factory=list)
     button: str = "Pick a slot"
     header: str = ""
+    # Cloud API shows this above the rows. It was hard-coded to "Slots", which
+    # then appeared over the service and date menus too.
+    section: str = ""
 
 
 TWILIO_BODY = 1600
+
+
+def normalise_phone(value: str) -> str:
+    """One canonical phone shape: "+" followed by digits.
+
+    The providers disagree. Meta's wa_id is bare digits ("966500000001"),
+    Twilio sends "whatsapp:+966500000001", and an admin registering a host
+    types whatever they like. Without this, the same person is two user rows
+    depending on which transport they came in on.
+    """
+    digits = "".join(character for character in value if character.isdigit())
+    return f"+{digits}" if digits else ""
 
 
 def render_numbered(reply: Reply) -> str:
@@ -104,7 +119,10 @@ class CloudTransport(Transport):
             "type": "list",
             "body": {"text": clip(reply.text, BODY_TEXT)},
             "action": {"button": clip(reply.button, BUTTON_TEXT),
-                       "sections": [{"title": "Slots", "rows": rows}]},
+                       "sections": [{
+                           "title": clip(reply.section or reply.button, 24),
+                           "rows": rows,
+                       }]},
         }
         if reply.header:
             interactive["header"] = {"type": "text",
@@ -133,11 +151,10 @@ class TwilioTransport(Transport):
         self.url = (f"https://api.twilio.com/2010-04-01/Accounts/"
                     f"{account_sid}/Messages.json")
         self.auth = (account_sid, auth_token)
-        self.from_number = (from_number if from_number.startswith("whatsapp:")
-                            else f"whatsapp:{from_number}")
+        self.from_number = f"whatsapp:{normalise_phone(from_number)}"
 
     def payload(self, to: str, reply: Reply) -> dict:
-        destination = to if to.startswith("whatsapp:") else f"whatsapp:{to}"
+        destination = f"whatsapp:{normalise_phone(to)}"
         return {
             "From": self.from_number,
             "To": destination,
@@ -233,7 +250,7 @@ def parse_twilio_form(params: dict[str, str]) -> list[Inbound]:
     Twilio delivers a single message per request, and its only reply type is
     text -- there are no button payloads to unpack.
     """
-    sender = (params.get("From") or "").replace("whatsapp:", "").strip()
+    sender = normalise_phone(params.get("From") or "")
     if not sender:
         return []
     return [Inbound(
@@ -255,11 +272,12 @@ def parse_webhook(body: dict) -> list[Inbound]:
         for change in entry.get("changes", []) or []:
             value = change.get("value", {}) or {}
             names = {
-                c.get("wa_id"): (c.get("profile") or {}).get("name", "")
+                normalise_phone(c.get("wa_id") or ""):
+                    (c.get("profile") or {}).get("name", "")
                 for c in value.get("contacts", []) or []
             }
             for message in value.get("messages", []) or []:
-                sender = message.get("from", "")
+                sender = normalise_phone(message.get("from", ""))
                 kind = message.get("type")
                 text = ""
                 is_tap = False

@@ -69,6 +69,12 @@ class FakeGoogle:
         self.deleted.append(external_id)
 
 
+@pytest.fixture(autouse=True)
+def state_secret(monkeypatch):
+    """gcal refuses to sign a state token without a configured secret."""
+    monkeypatch.setenv("WACAL_STATE_SECRET", "test-state-secret")
+
+
 @pytest.fixture()
 def conn():
     connection = db.connect(":memory:")

@@ -96,6 +96,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS events_no_double_book
 CREATE INDEX IF NOT EXISTS events_by_owner_window
     ON events(owner_id, start_utc, end_utc);
 
+CREATE INDEX IF NOT EXISTS events_by_host
+    ON events(host_slug, start_utc);
+
+CREATE INDEX IF NOT EXISTS events_by_booker
+    ON events(created_by, end_utc);
+
 -- Meta retries a webhook until it gets a 200, so the same message id can
 -- arrive several times. Seen ids are rejected before any booking happens.
 CREATE TABLE IF NOT EXISTS seen_messages (
@@ -106,10 +112,35 @@ CREATE TABLE IF NOT EXISTS seen_messages (
 -- Short-lived conversation state. Today it holds the row ids last offered
 -- to a number, so a typed "3" can stand in for tapping row 3.
 CREATE TABLE IF NOT EXISTS sessions (
-    phone      TEXT PRIMARY KEY,
+    phone      TEXT NOT NULL,
+    scope      TEXT NOT NULL DEFAULT 'peer',
     kind       TEXT NOT NULL,
     payload    TEXT NOT NULL,
-    expires_at TEXT NOT NULL
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (phone, scope)
+);
+
+-- Every outbound message is queued here first and marked sent only once the
+-- provider accepts it. Before this, a failed send to the customer skipped the
+-- owner's notification entirely and left no trace of a confirmed booking.
+CREATE TABLE IF NOT EXISTS outbox (
+    id         INTEGER PRIMARY KEY,
+    phone      TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    sent_at    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(sent_at, id);
+
+-- OAuth state tokens are single use. Without this a replayed or forged state
+-- lets someone attach their own Google account to another user's row.
+CREATE TABLE IF NOT EXISTS oauth_states (
+    nonce      TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL
 );
 """
 
@@ -166,8 +197,41 @@ ADDED_COLUMNS = {
 }
 
 
+# Tables whose shape changed incompatibly. These hold only ephemeral state,
+# so recreating them is cheaper and safer than rewriting rows in place.
+REBUILT_TABLES = {
+    "sessions": ("scope", """
+        CREATE TABLE sessions (
+            phone      TEXT NOT NULL,
+            scope      TEXT NOT NULL DEFAULT 'peer',
+            kind       TEXT NOT NULL,
+            payload    TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            PRIMARY KEY (phone, scope)
+        )"""),
+}
+
+
 def migrate(conn: sqlite3.Connection) -> list[str]:
     applied = []
+    for table, (required_column, create_sql) in REBUILT_TABLES.items():
+        present = {row["name"]
+                   for row in conn.execute(f"PRAGMA table_info({table})")}
+        if present and required_column not in present:
+            conn.execute(f"DROP TABLE {table}")
+            conn.execute(create_sql)
+            applied.append(f"{table} (rebuilt)")
+
+    # One canonical phone shape. Rows written before normalisation existed are
+    # bare digits, which makes the same person two users across transports.
+    bare = conn.execute(
+        "SELECT count(*) AS n FROM users WHERE phone NOT LIKE '+%'"
+    ).fetchone()["n"]
+    if bare:
+        with tx(conn):
+            conn.execute("UPDATE users SET phone = '+' || phone"
+                         " WHERE phone NOT LIKE '+%'")
+        applied.append(f"users.phone normalised ({bare} rows)")
     for table, columns in ADDED_COLUMNS.items():
         present = {
             row["name"]
@@ -319,12 +383,37 @@ def busy_intervals(conn, owner_id: int, start: datetime, end: datetime):
 
 
 class SlotTaken(Exception):
-    pass
+    """That owner already has a confirmed event starting at that instant."""
+
+
+class RefCollision(Exception):
+    """Two events drew the same short ref. Retried internally."""
+
+
+# SQLite reports a unique index violation by column list, not by index name:
+# "UNIQUE constraint failed: events.owner_id, events.start_utc".
+DOUBLE_BOOK_MESSAGE = "events.owner_id, events.start_utc"
+REF_COLLISION_MESSAGE = "events.ref"
+REF_ATTEMPTS = 5
 
 
 def create_event(conn, owner_id: int, created_by: int, start: datetime,
                  end: datetime, title: str, *, host_slug: str | None = None,
                  service: str | None = None):
+    for attempt in range(REF_ATTEMPTS):
+        try:
+            return _insert_event(conn, owner_id, created_by, start, end, title,
+                                 host_slug, service)
+        except RefCollision:
+            # Six characters of 36 collide often enough to matter past a few
+            # thousand events; a fresh ref is all that is needed.
+            if attempt == REF_ATTEMPTS - 1:
+                raise
+    raise AssertionError("unreachable")
+
+
+def _insert_event(conn, owner_id, created_by, start, end, title, host_slug,
+                  service):
     ref = new_ref()
     try:
         with tx(conn):
@@ -336,8 +425,10 @@ def create_event(conn, owner_id: int, created_by: int, start: datetime,
                  iso(now_utc()), host_slug, service),
             )
     except sqlite3.IntegrityError as exc:
-        if "events_no_double_book" in str(exc):
+        if DOUBLE_BOOK_MESSAGE in str(exc):
             raise SlotTaken(iso(start)) from exc
+        if REF_COLLISION_MESSAGE in str(exc):
+            raise RefCollision(ref) from exc
         raise
     return conn.execute("SELECT * FROM events WHERE ref = ?", (ref,)).fetchone()
 
@@ -491,8 +582,21 @@ def customer_bookings(conn, user_id: int, slug: str, since: datetime):
     ).fetchall()
 
 
+def already_seen(conn, message_id: str) -> bool:
+    if not message_id:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM seen_messages WHERE message_id = ?", (message_id,)
+    ).fetchone() is not None
+
+
 def mark_seen(conn, message_id: str) -> bool:
-    """True the first time a message id is seen, False on a Meta retry."""
+    """Record a message id. False if it was already there.
+
+    Call this only once the message has been handled. Marking it first means a
+    crash mid-handling is remembered as done, and the provider's retry -- the
+    one chance to recover -- is discarded.
+    """
     if not message_id:
         return True
     try:
@@ -509,26 +613,143 @@ def mark_seen(conn, message_id: str) -> bool:
 # --- sessions ------------------------------------------------------------
 
 
-def put_session(conn, phone: str, kind: str, payload: str, ttl_seconds: int = 3600):
+def put_session(conn, phone: str, scope: str, kind: str, payload: str,
+                ttl_seconds: int = 3600):
     from datetime import timedelta
 
     expires = now_utc() + timedelta(seconds=ttl_seconds)
     with tx(conn):
         conn.execute(
-            "INSERT INTO sessions (phone, kind, payload, expires_at)"
-            " VALUES (?, ?, ?, ?)"
-            " ON CONFLICT(phone) DO UPDATE SET kind = excluded.kind,"
+            "INSERT INTO sessions (phone, scope, kind, payload, expires_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(phone, scope) DO UPDATE SET kind = excluded.kind,"
             " payload = excluded.payload, expires_at = excluded.expires_at",
-            (phone, kind, payload, iso(expires)),
+            (phone, scope, kind, payload, iso(expires)),
         )
 
 
-def pop_session(conn, phone: str):
-    row = conn.execute("SELECT * FROM sessions WHERE phone = ?", (phone,)).fetchone()
+def pop_session(conn, phone: str, scope: str):
+    row = conn.execute(
+        "SELECT * FROM sessions WHERE phone = ? AND scope = ?", (phone, scope)
+    ).fetchone()
     if row is None:
         return None
     with tx(conn):
-        conn.execute("DELETE FROM sessions WHERE phone = ?", (phone,))
+        conn.execute("DELETE FROM sessions WHERE phone = ? AND scope = ?",
+                     (phone, scope))
     if row["expires_at"] < iso(now_utc()):
         return None
     return row
+
+
+# --- oauth states --------------------------------------------------------
+
+
+def create_oauth_state(conn, nonce: str, user_id: int) -> None:
+    with tx(conn):
+        conn.execute(
+            "INSERT INTO oauth_states (nonce, user_id, created_at)"
+            " VALUES (?, ?, ?)",
+            (nonce, user_id, iso(now_utc())),
+        )
+
+
+def consume_oauth_state(conn, nonce: str, user_id: int) -> bool:
+    """True once per nonce. A forged or replayed state has no row to consume."""
+    with tx(conn):
+        cur = conn.execute(
+            "DELETE FROM oauth_states WHERE nonce = ? AND user_id = ?",
+            (nonce, user_id),
+        )
+    return cur.rowcount > 0
+
+
+# --- outbox --------------------------------------------------------------
+
+
+def queue_outbound(conn, phone: str, reply) -> int:
+    """Persist one outbound message. Returns its outbox id."""
+    import json as _json
+
+    payload = _json.dumps({
+        "text": reply.text,
+        "button": reply.button,
+        "header": reply.header,
+        "rows": [{"id": row.id, "title": row.title,
+                  "description": row.description} for row in reply.rows],
+    }, ensure_ascii=False)
+    with tx(conn):
+        cur = conn.execute(
+            "INSERT INTO outbox (phone, payload, created_at) VALUES (?, ?, ?)",
+            (phone, payload, iso(now_utc())),
+        )
+    return cur.lastrowid
+
+
+def reply_from_row(row):
+    """Rebuild a Reply from a queued payload."""
+    import json as _json
+
+    from .whatsapp import Reply, Row
+
+    data = _json.loads(row["payload"])
+    return Reply(
+        text=data["text"],
+        rows=[Row(id=r["id"], title=r["title"], description=r["description"])
+              for r in data.get("rows", [])],
+        button=data.get("button", "Pick a slot"),
+        header=data.get("header", ""),
+    )
+
+
+def pending_outbound(conn, *, limit: int = 50, only: list[int] | None = None):
+    if only is not None:
+        if not only:
+            return []
+        marks = ",".join("?" for _ in only)
+        return conn.execute(
+            f"SELECT * FROM outbox WHERE sent_at IS NULL AND id IN ({marks})"
+            " ORDER BY id", only).fetchall()
+    return conn.execute(
+        "SELECT * FROM outbox WHERE sent_at IS NULL ORDER BY id LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
+def mark_outbound_sent(conn, outbox_id: int) -> None:
+    with tx(conn):
+        conn.execute("UPDATE outbox SET sent_at = ? WHERE id = ?",
+                     (iso(now_utc()), outbox_id))
+
+
+def record_outbound_failure(conn, outbox_id: int, error: str = "") -> None:
+    with tx(conn):
+        conn.execute(
+            "UPDATE outbox SET attempts = attempts + 1, last_error = ?"
+            " WHERE id = ?", (error[:500], outbox_id))
+
+
+# --- housekeeping --------------------------------------------------------
+
+
+def prune(conn, *, days: int = 7) -> dict[str, int]:
+    """Drop expired conversation state and old dedupe rows.
+
+    Nothing else deletes from these tables, so without this they grow forever.
+    """
+    from datetime import timedelta
+
+    cutoff = iso(now_utc() - timedelta(days=days))
+    now = iso(now_utc())
+    with tx(conn):
+        seen = conn.execute("DELETE FROM seen_messages WHERE seen_at < ?",
+                            (cutoff,)).rowcount
+        sessions = conn.execute("DELETE FROM sessions WHERE expires_at < ?",
+                                (now,)).rowcount
+        states = conn.execute("DELETE FROM oauth_states WHERE created_at < ?",
+                              (cutoff,)).rowcount
+        outbox = conn.execute(
+            "DELETE FROM outbox WHERE sent_at IS NOT NULL AND sent_at < ?",
+            (cutoff,)).rowcount
+    return {"seen_messages": seen, "sessions": sessions,
+            "oauth_states": states, "outbox": outbox}

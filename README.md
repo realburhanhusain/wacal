@@ -53,11 +53,16 @@ shared                   # who can book you, and who you can book
 | `free ahmed` | Rolls forward to the next day with an opening (14 days) |
 | tap a slot | Books it, notifies the owner, returns a ref |
 | `block tomorrow 14:00-15:00 Focus` | Blocks your own time |
+| `closed 2026-12-25` | Blocks a whole working day, holidays included |
 | `my` | Upcoming bookings with their refs |
 | `cancel ABC123` | Unblocks the slot and tells the other party |
 | `connect google` / `disconnect google` | Link an external calendar |
 | `mylink` | Your business booking page, if you have one |
 | `name` / `tz` / `hours` / `days` / `me` | Your settings |
+
+A host owner reaches all of these on their business number too: one WhatsApp
+number maps to one webhook, so `/webhook/{slug}` delegates any non-booking
+command from the owner to the peer handler.
 
 Aliases are accepted for the common verbs, in English, Hindi and Arabic:
 `hi` / `नमस्ते` / `مرحبا`, `my bookings` / `मेरी बुकिंग`, `cancel` / `रद्द करें`,
@@ -118,8 +123,14 @@ Owner:    New booking at Dr Sharma Clinic. Ravi (+966...) Consultation · 150 SA
 ```
 
 Slot length follows the chosen service. The customer's own working hours are
-ignored — a patient is not at work — but their existing bookings still are.
+ignored — a patient is not at work — but their existing bookings still are. A
+new customer inherits the host's timezone, since nobody arrives having set one.
 The owner texting their own page gets the next 7 days of appointments.
+
+`reschedule` moves a booking: the old ref travels in the button ids and is
+cancelled only once the replacement exists. Each id also carries a fingerprint
+of the service it was built for, so editing the menu between two taps
+invalidates the old button instead of silently booking something else.
 
 | Endpoint | Method | Description |
 | --- | --- | --- |
@@ -141,7 +152,8 @@ The owner texting their own page gets the next 7 days of appointments.
 | `/docs` | GET | Swagger UI |
 
 `ADMIN_KEY` unset makes every `/dashboard/*` route answer 503. An admin API
-that opens itself when a variable is missing is worse than no admin API.
+that opens itself when a variable is missing is worse than no admin API. The
+same rule applies to the webhooks: see [SECURITY.md](SECURITY.md).
 
 ## Google Calendar
 
@@ -218,7 +230,7 @@ cp .env.example .env            # then fill it in
 python start.py                 # migrates, seeds a demo host, then serves
 python start.py --no-demo --reload --port 9000
 uvicorn wacal.main:app --port 8000     # or plain, no seeding
-pytest -q                       # 115 tests
+pytest -q                       # 151 tests
 ```
 
 Expose port 8000 with `ngrok http 8000` or `cloudflared tunnel`. In the Meta
@@ -248,6 +260,10 @@ Deliberate prototype limits, not oversights:
   unique index is what actually prevents double booking and ports directly.
 - **Google tokens are stored as plain JSON** in the `calendar_links` table.
   Encrypt at rest before production, and treat the database file accordingly.
+- **No rate limiting.** A valid signature can be replayed as volume.
+- **Outbound messages are queued** in `outbox` and retried on the next
+  dispatch, but nothing drains it on a timer yet, so a message that fails while
+  nobody is messaging waits for the next inbound one.
 - **One external calendar per user, Google only.** Microsoft Graph would
   implement the same four methods in `wacal/gcal.py`.
 - **No CORS.** Their reference implementation allows every origin on its admin

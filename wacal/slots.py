@@ -167,9 +167,33 @@ def parse_day(text: str, *, today: date) -> date | None:
         return None
 
 
-def fmt_slot(start: datetime, end: datetime, zone: str) -> str:
+def fmt_slot(start: datetime, end: datetime, zone: str, *,
+             show_offset: bool = False) -> str:
     z = tz_of(zone)
-    return f"{start.astimezone(z):%H:%M}-{end.astimezone(z):%H:%M}"
+    local_start, local_end = start.astimezone(z), end.astimezone(z)
+    label = f"{local_start:%H:%M}-{local_end:%H:%M}"
+    return f"{label} {local_start:%z}" if show_offset else label
+
+
+def ambiguous_day(slots: list[tuple[datetime, datetime]], zone: str) -> bool:
+    """True when two slots on this day share a wall-clock label.
+
+    On a DST fall-back night 01:30 happens twice, so "01:30-02:00" would be
+    printed for two different instants -- and one slot renders backwards. The
+    caller appends the UTC offset to keep the labels distinct.
+    """
+    z = tz_of(zone)
+    offsets = {start.astimezone(z).utcoffset() for start, _ in slots}
+    return len(offsets) > 1
+
+
+def local_date(moment: datetime, zone: str) -> date:
+    """The calendar date of an instant for a viewer in this timezone.
+
+    A slot that is Friday for the host can be Thursday for the customer, so
+    the date beside a time must come from the same timezone as the time.
+    """
+    return moment.astimezone(tz_of(zone)).date()
 
 
 def fmt_dt(dt: datetime | str, zone: str) -> str:

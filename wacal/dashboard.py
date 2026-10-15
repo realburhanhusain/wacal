@@ -13,11 +13,14 @@ import os
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import busy, db
 from .gcal import ExternalCalendarError
 from .slots import parse_hhmm, schedule_for
+from .whatsapp import normalise_phone
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -50,6 +53,14 @@ class WorkingHours(BaseModel):
             raise ValueError("expected HH:MM") from exc
         return f"{parsed:%H:%M}"
 
+    @model_validator(mode="after")
+    def end_after_start(self):
+        # An inverted window makes work_window return None for every day, so
+        # the page silently shows no openings at all.
+        if parse_hhmm(self.end) <= parse_hhmm(self.start):
+            raise ValueError("working_hours.end must be after start")
+        return self
+
 
 class HostIn(BaseModel):
     slug: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,38}$")
@@ -71,6 +82,23 @@ class HostIn(BaseModel):
         if not value or any(d < 0 or d > 6 for d in value):
             raise ValueError("working_days must be 0..6 with Monday=0")
         return sorted(set(value))
+
+    @field_validator("owner_phone")
+    @classmethod
+    def canonical_phone(cls, value: str) -> str:
+        phone = normalise_phone(value)
+        if len(phone) < 7:
+            raise ValueError("owner_phone needs at least 6 digits")
+        return phone
+
+    @field_validator("timezone")
+    @classmethod
+    def known_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"unknown IANA timezone {value!r}") from exc
+        return value
 
 
 class HostPatch(BaseModel):
@@ -149,16 +177,18 @@ async def register(payload: HostIn, request: Request,
 
     owner = db.get_user_by_phone(conn, payload.owner_phone)
     if owner is None:
+        # Only a brand-new owner takes the host's schedule as their personal
+        # one. Overwriting an existing user's own hours and timezone would
+        # contradict the whole point of storing opening hours on the host.
         owner = db.create_user(conn, payload.owner_phone,
                                payload.owner_name or payload.business_name,
                                payload.timezone)
-    db.update_user(
-        conn, owner["id"],
-        timezone=payload.timezone,
-        work_start=payload.working_hours.start,
-        work_end=payload.working_hours.end,
-        work_days=",".join(str(d) for d in payload.working_days),
-    )
+        db.update_user(
+            conn, owner["id"],
+            work_start=payload.working_hours.start,
+            work_end=payload.working_hours.end,
+            work_days=",".join(str(d) for d in payload.working_days),
+        )
     host = db.create_host(
         conn, payload.slug, owner["id"], payload.business_name,
         location=payload.location,
