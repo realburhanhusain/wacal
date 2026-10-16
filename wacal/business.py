@@ -18,13 +18,14 @@ import json
 import re
 from datetime import date, datetime, timedelta, timezone
 
-from . import busy, commands, db, keywords
-from .commands import (
+from . import commands, db, keywords
+from .booking import (
     Outcome,
-    _mirror,
-    _slots_on,
+    book,
     ensure_user,
     prefetch_busy,
+    release,
+    slots_on,
     text,
 )
 from .gcal import ExternalCalendarError
@@ -192,7 +193,7 @@ def _show_dates(conn, host, owner, user, menu, index, token, now,
     while len(rows) < DATE_CHOICES and checked < LOOKAHEAD_DAYS:
         checked += 1
         if work_window(schedule, day) is not None:
-            slots = _slots_on(conn, schedule, user, day, now,
+            slots = slots_on(conn, schedule, user, day, now,
                               slot_minutes=duration, requester_hours=False,
                               prefetched=prefetched)
             if slots:
@@ -232,7 +233,7 @@ def _show_slots(conn, host, owner, user, menu, index, token, day, now,
     schedule = schedule_for(owner, host)
     duration = int(service.get("duration_mins") or schedule["slot_minutes"])
     try:
-        slots = _slots_on(conn, schedule, user, day, now, slot_minutes=duration,
+        slots = slots_on(conn, schedule, user, day, now, slot_minutes=duration,
                           requester_hours=False)
     except ExternalCalendarError:
         return text(f"Cannot read {host['business_name']}'s calendar right now.")
@@ -312,7 +313,7 @@ def _confirm(conn, host, owner, user, menu, index, token, start, now,
     try:
         still_free = any(
             s == start
-            for s, _ in _slots_on(conn, schedule, user, day, now,
+            for s, _ in slots_on(conn, schedule, user, day, now,
                                   slot_minutes=duration, requester_hours=False)
         )
     except ExternalCalendarError:
@@ -323,8 +324,13 @@ def _confirm(conn, host, owner, user, menu, index, token, start, now,
 
     title = f"{service['name']} — {user['display_name']}"
     try:
-        event = db.create_event(conn, owner["id"], user["id"], start, end, title,
-                                host_slug=host["slug"], service=service["name"])
+        event, mirror_note = book(
+            conn, owner, user, start, end, title,
+            host_slug=host["slug"], service=service["name"],
+            description=f"{service['name']} booked via WhatsApp by "
+                        f"{user['display_name']} {user['phone']}",
+            location=host["location"],
+        )
     except db.SlotTaken:
         return text("That time was just booked by someone else. "
                     "Send 'hi' to retry.")
@@ -332,13 +338,6 @@ def _confirm(conn, host, owner, user, menu, index, token, start, now,
     # The old booking goes only once the new one exists, so a failure here
     # never leaves the customer with nothing.
     moved = _release_replaced(conn, host, user, replacing)
-
-    mirror_note = _mirror(
-        conn, owner, event,
-        description=f"{service['name']} booked via WhatsApp by "
-                    f"{user['display_name']} {user['phone']}",
-        location=host["location"],
-    )
 
     zone = user["timezone"]
     customer = Reply(text=(
@@ -366,9 +365,7 @@ def _release_replaced(conn, host, user, ref: str) -> str:
         return ""
     if previous["created_by"] != user["id"] or previous["status"] != "confirmed":
         return ""
-    db.cancel_event(conn, ref)
-    if previous["external_id"]:
-        busy.mirror_delete(conn, previous)
+    release(conn, previous)
     return f"\nBooking {ref} has been cancelled."
 
 
@@ -506,10 +503,7 @@ def _cancel(conn, host, owner, user, raw: str, now) -> Outcome:
     if event["status"] != "confirmed":
         return text(f"{ref} is already cancelled.")
 
-    db.cancel_event(conn, ref)
-    stale = ""
-    if event["external_id"] and not busy.mirror_delete(conn, event):
-        stale = "\nNote: the copy in Google Calendar could not be removed."
+    stale = release(conn, event)
 
     start = datetime.fromisoformat(event["start_utc"])
     confirm = Reply(text=f"Cancelled {ref} — {fmt_dt(start, user['timezone'])}. "

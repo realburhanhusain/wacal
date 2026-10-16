@@ -8,10 +8,21 @@ decides how to deliver them.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
 from . import busy, db, gcal, keywords
+from .booking import (
+    CALENDAR_UNREACHABLE,
+    KNOWN_VERBS,
+    Outcome,
+    book,
+    ensure_user,
+    mirror,
+    prefetch_busy,
+    release,
+    slots_on,
+    text,
+)
 from .gcal import ExternalCalendarError, NotConfigured
 from .slots import (
     ambiguous_day,
@@ -44,71 +55,6 @@ HELP = (
     "• name <your name> / tz <Area/City> / hours 09:00-17:00 / days mon-fri\n"
     "• me — your settings"
 )
-
-# Words that must never be mistaken for somebody's name.
-KNOWN_VERBS = {
-    "help", "book", "me", "name", "register", "tz", "timezone", "hours",
-    "days", "share", "unshare", "shared", "free", "slots", "availability",
-    "block", "closed", "my", "mine", "bookings", "cancel", "unblock",
-    "connect", "disconnect", "mylink", "link", "reschedule", "change",
-    "yes", "no",
-}
-
-CALENDAR_UNREACHABLE = (
-    "Cannot read {name}'s connected Google Calendar right now, so I will not "
-    "guess at free time. Try again in a moment."
-)
-
-
-@dataclass
-class Outcome:
-    reply: Reply
-    notify: list[tuple[str, Reply]] = field(default_factory=list)
-
-
-def text(body: str) -> Outcome:
-    return Outcome(Reply(text=body))
-
-
-def ensure_user(conn, msg: Inbound, *, welcome: str = "", tz: str = "UTC"):
-    """Resolve the sender to a user row, registering them if needed.
-
-    Returns (user, outcome). A non-None outcome is the reply to send instead of
-    continuing -- a request for their name.
-
-    tz is the timezone a newly created user starts in. Business mode passes the
-    host's, because every reply renders in the viewer's timezone and a customer
-    who has never heard of this app cannot be asked to set one first.
-    """
-    user = db.get_user_by_phone(conn, msg.from_phone)
-    if user is not None:
-        return user, None
-
-    if msg.profile_name:
-        return db.create_user(conn, msg.from_phone, msg.profile_name, tz), None
-
-    lowered = msg.text.lower()
-    for prefix in ("name ", "register ", "i am ", "im "):
-        if lowered.startswith(prefix):
-            chosen = msg.text[len(prefix):].strip()
-            if chosen:
-                return db.create_user(conn, msg.from_phone, chosen, tz), None
-            break
-    else:
-        # A bare "Ravi" is the obvious answer to "what name should people
-        # see?", so accept it. Without this the prompt repeated forever. A
-        # known verb or alias is never mistaken for a name.
-        candidate = " ".join(msg.text.split())
-        first = candidate.split()[0].lower() if candidate else ""
-        if (candidate and len(candidate) <= 40
-                and keywords.canonical(candidate) is None
-                and first not in KNOWN_VERBS):
-            return db.create_user(conn, msg.from_phone, candidate, tz), None
-
-    return None, text(
-        "Welcome. What name should people see?\nReply: name Burhan"
-    )
-
 
 def handle(conn, msg: Inbound, *, now: datetime | None = None) -> Outcome:
     now = now or db.now_utc()
@@ -388,7 +334,7 @@ def _do_free(conn, user, rest, now) -> Outcome:
                                    first_day + timedelta(days=span))
         for offset in range(span):
             day_used = first_day + timedelta(days=offset)
-            found = _slots_on(conn, owner, user, day_used, now,
+            found = slots_on(conn, owner, user, day_used, now,
                               prefetched=prefetched)
             if found:
                 break
@@ -433,60 +379,6 @@ def _do_free(conn, user, rest, now) -> Outcome:
     )
 
 
-def prefetch_busy(conn, owner, requester, first_day: date, last_day: date,
-                  *, mutual: bool = True):
-    """Both parties' busy intervals for a whole date range, in one pass.
-
-    Scanning day by day meant one Google round trip per candidate day -- up to
-    60 for a single "pick a service" tap, serially, while holding the lock.
-    """
-    start = datetime.combine(first_day, datetime.min.time(),
-                             tzinfo=timezone.utc) - timedelta(days=1)
-    end = datetime.combine(last_day, datetime.min.time(),
-                           tzinfo=timezone.utc) + timedelta(days=2)
-    owner_busy = busy.busy_for(conn, owner["id"], start, end)
-    if not mutual or owner["id"] == requester["id"]:
-        return owner_busy, owner_busy
-    return owner_busy, busy.busy_for(conn, requester["id"], start, end)
-
-
-def _slots_on(conn, owner, requester, day: date, now: datetime,
-              *, slot_minutes: int | None = None, mutual: bool = True,
-              requester_hours: bool = True, prefetched=None):
-    """Free slots on one day, across both people and both calendar sources.
-
-    Raises ExternalCalendarError when a connected Google Calendar cannot be
-    read. Callers must pass that on to the user instead of offering slots.
-
-    prefetched is an (owner_busy, requester_busy) pair covering at least this
-    day; pass it when looping over days so the calendars are read once.
-    """
-    if prefetched is not None:
-        owner_busy, requester_busy = prefetched
-        effective_requester = (
-            owner if (not mutual or owner["id"] == requester["id"]) else requester
-        )
-        return mutual_free_slots(
-            owner, owner_busy, effective_requester, requester_busy, day,
-            now=now, slot_minutes=slot_minutes,
-            requester_hours=requester_hours,
-        )
-
-    pad_start = datetime.combine(day, datetime.min.time(),
-                                 tzinfo=timezone.utc) - timedelta(days=1)
-    pad_end = pad_start + timedelta(days=3)
-    owner_busy = busy.busy_for(conn, owner["id"], pad_start, pad_end)
-    if not mutual or owner["id"] == requester["id"]:
-        requester_busy, effective_requester = owner_busy, owner
-    else:
-        requester_busy = busy.busy_for(conn, requester["id"], pad_start, pad_end)
-        effective_requester = requester
-    return mutual_free_slots(
-        owner, owner_busy, effective_requester, requester_busy, day, now=now,
-        slot_minutes=slot_minutes, requester_hours=requester_hours,
-    )
-
-
 def _do_tap(conn, user, raw, now) -> Outcome:
     try:
         _, owner_id_text, epoch_text = raw.split(":", 2)
@@ -510,7 +402,7 @@ def _do_tap(conn, user, raw, now) -> Outcome:
     try:
         still_free = any(
             s == start
-            for s, _ in _slots_on(
+            for s, _ in slots_on(
                 conn, owner, user,
                 start.astimezone(tz_of(owner["timezone"])).date(), now)
         )
@@ -524,12 +416,11 @@ def _do_tap(conn, user, raw, now) -> Outcome:
 
     title = f"{user['display_name']} / {owner['display_name']}"
     try:
-        event = db.create_event(conn, owner["id"], user["id"], start, end, title)
+        event, mirror_note = book(
+            conn, owner, user, start, end, title,
+            description=f"Booked via WhatsApp by {user['phone']}")
     except db.SlotTaken:
         return text("Someone took that slot a moment ago. Ask for a fresh list.")
-
-    mirror_note = _mirror(conn, owner, event,
-                          description=f"Booked via WhatsApp by {user['phone']}")
 
     confirm = Reply(
         text=f"Booked {owner['display_name']} — {fmt_dt(start, user['timezone'])} "
@@ -548,22 +439,6 @@ def _do_tap(conn, user, raw, now) -> Outcome:
              f"cancel {event['ref']}{mirror_note}"
     )
     return Outcome(confirm, notify=[(owner["phone"], owner_note)])
-
-
-def _mirror(conn, owner, event, *, description: str = "",
-            location: str = "") -> str:
-    """Copy the booking to the owner's external calendar, if they linked one.
-
-    Returns a sentence to append to the owner's message when the copy failed,
-    so a silent divergence between the two calendars cannot go unnoticed.
-    """
-    if db.get_calendar_link(conn, owner["id"]) is None:
-        return ""
-    if busy.mirror_create(conn, owner, event, description=description,
-                          location=location):
-        return ""
-    return ("\nNote: this booking is held here but could not be written to "
-            "your Google Calendar.")
 
 
 def _do_block(conn, user, rest, now) -> Outcome:
@@ -593,10 +468,10 @@ def _do_block(conn, user, rest, now) -> Outcome:
     if overlap:
         return text("That overlaps something already on your calendar.")
     try:
-        event = db.create_event(conn, user["id"], user["id"], start, end, title)
+        event, mirror_note = book(conn, user, user, start, end, title,
+                                  description="Blocked via WhatsApp")
     except db.SlotTaken:
         return text("That slot is already blocked.")
-    mirror_note = _mirror(conn, user, event, description="Blocked via WhatsApp")
     return text(
         f"Blocked {fmt_dt(start, user['timezone'])}-"
         f"{end.astimezone(zone):%H:%M} — {title}\n"
@@ -636,10 +511,10 @@ def _do_closed(conn, user, rest, now) -> Outcome:
             f"Cancel them first with: my"
         )
     try:
-        event = db.create_event(conn, user["id"], user["id"], start, end, reason)
+        event, mirror_note = book(conn, user, user, start, end, reason,
+                                  description="Closed via WhatsApp")
     except db.SlotTaken:
         return text(f"{day:%a %d %b} is already blocked.")
-    mirror_note = _mirror(conn, user, event, description="Closed via WhatsApp")
     zone = user["timezone"]
     return text(
         f"Closed {day:%a %d %b} — {start.astimezone(tz_of(zone)):%H:%M} to "
@@ -681,13 +556,9 @@ def _do_cancel(conn, user, rest) -> Outcome:
         return text("Only the owner or the person who booked it can cancel.")
     if event["status"] != "confirmed":
         return text(f"{ref} is already cancelled.")
-    db.cancel_event(conn, ref)
-
-    # Delete the mirrored copy using the stored external id, not the local ref.
-    stale = ""
-    if event["external_id"] and not busy.mirror_delete(conn, event):
-        stale = ("\nNote: the copy in the Google Calendar could not be removed; "
-                 "delete it there as well.")
+    # release() deletes the mirrored copy by its stored external id, never by
+    # the local ref.
+    stale = release(conn, event)
 
     start = datetime.fromisoformat(event["start_utc"])
     confirm = Reply(text=f"Cancelled {ref} — {fmt_dt(start, user['timezone'])}. "

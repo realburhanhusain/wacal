@@ -254,7 +254,7 @@ def signed_url(request: Request) -> str:
 
 
 def _unknown_host():
-    from .commands import text
+    from .booking import text
 
     return text("This booking link is not active.")
 
