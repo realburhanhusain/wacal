@@ -74,6 +74,22 @@ def main() -> int:
     print(f"Dashboard API       {base}/dashboard/{DEMO_SLUG}  (x-api-key)")
     print(f"API docs            {base}/docs")
     print(f"Transport           {transport}")
+
+    from wacal import templates
+
+    named = {kind: name for kind, name in templates.configured().items()
+             if name}
+    print("Templates           "
+          + (", ".join(f"{k}={v}" for k, v in named.items()) or "none"))
+    if not named and not templates.allow_freeform_outside_window():
+        # Otherwise this failure is invisible: the app looks healthy and the
+        # owner simply never hears about their bookings.
+        print("  No approved template is configured, so a notification to "
+              "anyone who has not\n  messaged this number in the last 24 "
+              "hours is refused rather than sent. Set\n  WA_TEMPLATE_* (see "
+              "README), or WACAL_ALLOW_FREEFORM_OUTSIDE_WINDOW=1 locally.")
+    if templates.require_otp():
+        print("OTP                 required before /dashboard/register")
     if not os.environ.get("ADMIN_KEY"):
         print("ADMIN_KEY is unset, so every /dashboard route will answer 503.")
     print()

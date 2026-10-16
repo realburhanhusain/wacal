@@ -242,7 +242,7 @@ def test_a_failed_send_is_retried_and_the_booking_is_kept(dispatch_client,
     transport = main.app.state.transport
     calls = {"n": 0}
 
-    async def flaky(to, reply):
+    async def flaky(to, reply, *, force_template=False):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("provider down")

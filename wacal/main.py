@@ -28,7 +28,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from starlette.concurrency import run_in_threadpool
 
-from . import db, gcal, numbering, ratelimit, singleton
+from . import db, gcal, numbering, ratelimit, singleton, templates
 from .auth import router as auth_router
 from .business import handle_business
 from .commands import handle
@@ -196,6 +196,9 @@ def _handle_one(database, host, host_slug: str | None, message,
     deadlocks: the RLock is held by one thread and wanted by another.
     """
     with db.LOCK:
+        # Before the dedupe check: a redelivered message still proves the
+        # number messaged us, and that is what reopens the 24-hour window.
+        db.touch_inbound(database, message.from_phone)
         if db.already_seen(database, message.message_id):
             return []
 
@@ -241,17 +244,38 @@ async def drain_outbox(database, sender, *, only: list[int] | None = None,
 
     A send that raises leaves the row pending with an attempt count, which is
     both the retry mechanism and the record of what failed overnight.
+
+    Outside the recipient's 24-hour window only an approved template is
+    delivered. With no template for that message the row is left pending with
+    the reason recorded, because the alternative -- sending free-form text
+    that WhatsApp drops -- is a failure the app would report as a success.
     """
     sent = 0
     for row in db.pending_outbound(database, limit=limit, only=only):
+        reply = db.reply_from_row(row)
+        status = templates.delivery_status(
+            inside_window=db.within_window(database, row["phone"]),
+            template=reply.template,
+            kind=reply.template.kind if reply.template else "",
+        )
+        if not status.deliverable:
+            db.record_outbound_failure(database, row["id"], status.reason)
+            logger.error("cannot deliver outbox %s to %s: %s", row["id"],
+                         row["phone"], status.reason)
+            continue
         try:
-            await sender.send(row["phone"], db.reply_from_row(row))
-        except Exception:  # noqa: BLE001 - retried, and logged for the morning
-            db.record_outbound_failure(database, row["id"])
+            await sender.send(row["phone"], reply,
+                              force_template=status.force_template)
+        except Exception as exc:  # noqa: BLE001 - retried, logged for the morning
+            db.record_outbound_failure(database, row["id"], str(exc))
             logger.exception("send to %s failed (outbox %s)", row["phone"],
                              row["id"])
             continue
         db.mark_outbound_sent(database, row["id"])
+        if reply.template is not None and reply.template.kind == templates.OTP:
+            # The code is hashed in otp_codes, but this row holds it in the
+            # clear and has no further use now that it has been delivered.
+            db.redact_outbound(database, row["id"])
         sent += 1
     return sent
 

@@ -9,10 +9,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import os
 from dataclasses import dataclass, field
 
 import httpx
+
+from .templates import Template
 
 GRAPH_VERSION = os.environ.get("WA_GRAPH_VERSION", "v21.0")
 
@@ -38,7 +41,13 @@ class Row:
 
 @dataclass
 class Reply:
-    """What to send back. Either plain text, or text plus a tappable list."""
+    """What to send back. Either plain text, or text plus a tappable list.
+
+    template is the approved template carrying the same information, used when
+    the recipient is outside their 24-hour window and free-form text would be
+    dropped by the provider. A reply with no template is a reply that can only
+    be delivered inside the window; see wacal.templates.
+    """
 
     text: str
     rows: list[Row] = field(default_factory=list)
@@ -47,6 +56,15 @@ class Reply:
     # Cloud API shows this above the rows. It was hard-coded to "Slots", which
     # then appeared over the service and date menus too.
     section: str = ""
+    template: Template | None = None
+
+
+class TemplateRequired(RuntimeError):
+    """A send demanded a template and the reply has none.
+
+    Raised rather than silently falling back to text, because the fallback is
+    delivered to nobody and recorded as a success.
+    """
 
 
 TWILIO_BODY = 1600
@@ -82,7 +100,13 @@ def render_numbered(reply: Reply) -> str:
 
 
 class Transport:
-    async def send(self, to: str, reply: Reply) -> dict:  # pragma: no cover
+    async def send(self, to: str, reply: Reply, *,
+                   force_template: bool = False) -> dict:  # pragma: no cover
+        """Deliver one reply.
+
+        force_template is set by the caller when the recipient is outside
+        their 24-hour window, where the provider accepts nothing else.
+        """
         raise NotImplementedError
 
 
@@ -91,9 +115,17 @@ class MemoryTransport(Transport):
 
     def __init__(self) -> None:
         self.sent: list[tuple[str, Reply]] = []
+        # Which of those went as a template. Kept apart from `sent` so the
+        # existing (to, reply) shape every test unpacks still holds.
+        self.templated: list[bool] = []
 
-    async def send(self, to: str, reply: Reply) -> dict:
+    async def send(self, to: str, reply: Reply, *,
+                   force_template: bool = False) -> dict:
+        if force_template and not (reply.template and reply.template.name):
+            raise TemplateRequired(
+                f"no template on a message to {to} that must be a template")
         self.sent.append((to, reply))
+        self.templated.append(force_template)
         return {"messages": [{"id": f"local.{len(self.sent)}"}]}
 
 
@@ -102,7 +134,47 @@ class CloudTransport(Transport):
         self.url = f"https://graph.facebook.com/{GRAPH_VERSION}/{phone_number_id}/messages"
         self.token = token
 
-    def payload(self, to: str, reply: Reply) -> dict:
+    def template_payload(self, to: str, reply: Reply) -> dict:
+        """A template message -- the only kind delivered outside 24 hours.
+
+        Components are sent only when they have parameters: Meta rejects an
+        empty body component, and an approved template with no variables must
+        be sent with no components at all.
+        """
+        template = reply.template
+        if template is None or not template.name:
+            raise TemplateRequired(
+                f"no template on a message to {to} that must be a template")
+        components: list[dict] = []
+        if template.body_params:
+            components.append({
+                "type": "body",
+                "parameters": [{"type": "text", "text": value}
+                               for value in template.body_params],
+            })
+        if template.button_params:
+            # Authentication templates repeat the code on their one-time-code
+            # button. index is a string in this API, not an integer.
+            components.append({
+                "type": "button",
+                "sub_type": template.button_sub_type,
+                "index": "0",
+                "parameters": [{"type": "text", "text": value}
+                               for value in template.button_params],
+            })
+        body = {
+            "name": template.name,
+            "language": {"code": template.language},
+        }
+        if components:
+            body["components"] = components
+        return {"messaging_product": "whatsapp", "recipient_type": "individual",
+                "to": to, "type": "template", "template": body}
+
+    def payload(self, to: str, reply: Reply, *,
+                force_template: bool = False) -> dict:
+        if force_template:
+            return self.template_payload(to, reply)
         base = {"messaging_product": "whatsapp", "recipient_type": "individual",
                 "to": to}
         if not reply.rows:
@@ -129,11 +201,12 @@ class CloudTransport(Transport):
                                      "text": clip(reply.header, 60)}
         return {**base, "type": "interactive", "interactive": interactive}
 
-    async def send(self, to: str, reply: Reply) -> dict:
+    async def send(self, to: str, reply: Reply, *,
+                   force_template: bool = False) -> dict:
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(
                 self.url,
-                json=self.payload(to, reply),
+                json=self.payload(to, reply, force_template=force_template),
                 headers={"Authorization": f"Bearer {self.token}"},
             )
             response.raise_for_status()
@@ -153,18 +226,47 @@ class TwilioTransport(Transport):
         self.auth = (account_sid, auth_token)
         self.from_number = f"whatsapp:{normalise_phone(from_number)}"
 
-    def payload(self, to: str, reply: Reply) -> dict:
+    def payload(self, to: str, reply: Reply, *,
+                force_template: bool = False) -> dict:
         destination = f"whatsapp:{normalise_phone(to)}"
+        if force_template:
+            template = reply.template
+            if template is None or not template.name:
+                raise TemplateRequired(
+                    f"no template on a message to {to} that must be a "
+                    f"template")
+            # Twilio's equivalent of an approved template is a Content
+            # template, addressed by its ContentSid (HX...) rather than by
+            # name, with variables numbered from 1. Setting WA_TEMPLATE_* to a
+            # template *name* here sends a 21656 from Twilio, so say so now.
+            if not template.name.startswith("HX"):
+                raise TemplateRequired(
+                    f"Twilio needs a Content template SID (HX...) for "
+                    f"{template.kind!r}, not the name {template.name!r}. "
+                    f"Create the content template in Twilio and put its SID "
+                    f"in WA_TEMPLATE_{template.kind.upper()}."
+                )
+            variables = {str(index): value for index, value
+                         in enumerate(template.body_params, start=1)}
+            data = {"From": self.from_number, "To": destination,
+                    "ContentSid": template.name}
+            if variables:
+                data["ContentVariables"] = json.dumps(variables,
+                                                      ensure_ascii=False)
+            return data
         return {
             "From": self.from_number,
             "To": destination,
             "Body": clip(render_numbered(reply), TWILIO_BODY),
         }
 
-    async def send(self, to: str, reply: Reply) -> dict:
+    async def send(self, to: str, reply: Reply, *,
+                   force_template: bool = False) -> dict:
         async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(self.url, data=self.payload(to, reply),
-                                         auth=self.auth)
+            response = await client.post(
+                self.url,
+                data=self.payload(to, reply, force_template=force_template),
+                auth=self.auth)
             response.raise_for_status()
             return response.json()
 

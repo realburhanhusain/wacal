@@ -96,9 +96,44 @@ redelivering them, and one sender's block never affects another's.
 In-memory state, which is correct because the app refuses to run as more than
 one process.
 
+## One-time codes
+
+An inbound WhatsApp message proves its sender: Meta signs the webhook and the
+number is observed. A number somebody *types* into
+`POST /dashboard/register` proves nothing, and that number then receives other
+people's booking details — so a typo there is a disclosure. Under
+`WACAL_REQUIRE_OTP=1` registration refuses a number that has not answered a
+code.
+
+The code is never stored. `otp_codes` holds `HMAC-SHA256(pepper, phone:code)`,
+keyed with `WACAL_OTP_PEPPER` or `WACAL_TOKEN_KEY` and **bound to the phone**,
+so a row copied onto another number verifies nothing there. Six digits is
+weak on its own, so the cap is the control: ten-minute expiry, five attempts
+before the challenge is destroyed, one resend a minute, and single use —
+verifying consumes the challenge in the same transaction that records the
+proof, so two concurrent verifications cannot both succeed. `tests/
+mutation_check.py` has mutants for an unlimited and a never-expiring code;
+both are killed.
+
+## Messages outside the 24-hour window fail visibly
+
+WhatsApp drops a free-form message sent more than 24 hours after the
+recipient's last inbound one. Before this, wacal sent those anyway and
+recorded them as delivered, so an owner could simply never learn about a
+confirmed booking.
+
+Now the drainer checks `contact_window` for the recipient and either sends an
+approved template or **refuses**: the outbox row stays pending with the reason
+in `last_error`, retried on every tick and delivered the moment that person
+next messages the number. The local escape hatch
+(`WACAL_ALLOW_FREEFORM_OUTSIDE_WINDOW=1`) is deliberate and loud — setting it
+in production turns a visible refusal back into an invisible drop. A number we
+have never heard from counts as *outside* the window, not inside it.
+
 ## Still outstanding
 
 - Nothing from the two reviews. See the README for the deliberate product
-  limits that remain (templates, OTP at registration, payments).
+  limits that remain (Meta Business verification and template approval,
+  payments, reminders).
 
 Report anything found here by opening an issue.

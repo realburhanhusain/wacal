@@ -11,7 +11,7 @@ import os
 import re
 from datetime import date, datetime, timedelta, timezone
 
-from . import busy, db, gcal, keywords
+from . import busy, db, gcal, keywords, templates
 from .booking import (
     CALENDAR_UNREACHABLE,
     KNOWN_VERBS,
@@ -441,7 +441,17 @@ def _do_tap(conn, user, raw, now) -> Outcome:
              f"{fmt_dt(start, owner['timezone'])} to "
              f"{end.astimezone(tz_of(owner['timezone'])):%H:%M} "
              f"({owner['timezone']}).\nRef {event['ref']} · cancel with: "
-             f"cancel {event['ref']}{mirror_note}"
+             f"cancel {event['ref']}{mirror_note}",
+        # Delivered even when the owner is outside their 24-hour window; see
+        # wacal.templates.
+        template=templates.build(
+            templates.BOOKING_CONFIRMED,
+            f"{user['display_name']} booked you",
+            f"{fmt_dt(start, owner['timezone'])} to "
+            f"{end.astimezone(tz_of(owner['timezone'])):%H:%M} "
+            f"({owner['timezone']})",
+            event["ref"],
+        ),
     )
     return Outcome(confirm, notify=[(owner["phone"], owner_note)])
 
@@ -630,7 +640,13 @@ def _do_cancel(conn, user, rest) -> Outcome:
     other = db.get_user(conn, other_id)
     note = Reply(
         text=f"{user['display_name']} cancelled {ref} — "
-             f"{fmt_dt(start, other['timezone'])} ({other['timezone']})."
+             f"{fmt_dt(start, other['timezone'])} ({other['timezone']}).",
+        template=templates.build(
+            templates.BOOKING_CANCELLED,
+            f"{user['display_name']} cancelled a booking with you",
+            f"{fmt_dt(start, other['timezone'])} ({other['timezone']})",
+            ref,
+        ),
     )
     return Outcome(confirm, notify=[(other["phone"], note)])
 

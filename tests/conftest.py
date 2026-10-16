@@ -79,6 +79,19 @@ def secrets_configured(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def freeform_allowed(monkeypatch):
+    """Run the suite under the local free-form escape hatch.
+
+    Most tests assert on what the *owner* was told, and in those tests the
+    owner has never sent an inbound message, so their real 24-hour window is
+    shut and nothing free-form would reach them. Rather than teach every test
+    about templates, the suite sets the documented local hatch, and
+    tests/test_templates.py unsets it to cover the window rule itself.
+    """
+    monkeypatch.setenv("WACAL_ALLOW_FREEFORM_OUTSIDE_WINDOW", "1")
+
+
+@pytest.fixture(autouse=True)
 def fresh_rate_limiter():
     """The limiter is module state, so it would leak between tests."""
     from wacal import main

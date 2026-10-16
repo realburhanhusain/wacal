@@ -223,6 +223,93 @@ Twilio signs the exact URL configured in its console. Behind a proxy that
 terminates TLS, `str(request.url)` is `http://...` internally and every request
 fails the check -- set `TWILIO_PUBLIC_URL` to the public value.
 
+## The 24-hour window, and template messages
+
+WhatsApp opens a 24-hour window when someone messages you and closes it 24
+hours after their last message. Inside it, anything can be sent. Outside it
+only a **template Meta approved in advance** is delivered; free-form text is
+rejected with error 131047 and the message is gone.
+
+This matters because the messages wacal sends outside a conversation are
+exactly the important ones: "someone just booked you", "your booking was
+cancelled", a verification code. The owner has usually not texted the app that
+day, so their window is shut.
+
+Each notification is a *kind*, and each kind reads its approved name from the
+environment:
+
+```
+WA_TEMPLATE_BOOKING_CONFIRMED=wacal_booking_confirmed
+WA_TEMPLATE_BOOKING_CANCELLED=wacal_booking_cancelled
+WA_TEMPLATE_OTP=wacal_otp
+WA_TEMPLATE_LANGUAGE=en                 # must match the approved language
+```
+
+Create these in WhatsApp Manager > Message templates with three body
+variables, in this order:
+
+| Kind | Category | `{{1}}` | `{{2}}` | `{{3}}` |
+| --- | --- | --- | --- | --- |
+| `booking_confirmed` | Utility | who booked what | when, with timezone | ref |
+| `booking_cancelled` | Utility | who cancelled | when, with timezone | ref |
+| `otp` | Authentication | the code | — | — |
+
+A body of, for example, `New booking: {{1}}` / `When: {{2}}` / `Ref: {{3}}`.
+The authentication template is built from Meta's own fixed copy; tick the
+copy-code button and wacal passes the code to it as well as to the body.
+
+Behaviour with nothing configured: a message to someone **inside** their
+window still goes as normal text, and a message to someone **outside** it is
+refused -- the outbox row stays pending with the reason in `last_error`, and
+goes out by itself the moment that person next messages the number. Nothing is
+lost, and nothing is reported as sent that was not. `python start.py` prints a
+warning when no template is configured.
+
+For local work, `WACAL_ALLOW_FREEFORM_OUTSIDE_WINDOW=1` sends anyway. Setting
+it in production converts a visible refusal into an invisible drop.
+
+On Twilio the same kinds are addressed by **Content template SID** (`HX...`),
+not by name, so `WA_TEMPLATE_*` holds the SID there and variables are numbered
+from 1.
+
+## Verifying a phone number nobody has proved
+
+An inbound message already proves its sender -- Meta signs the webhook. What
+is unproved is a number somebody *types*: `POST /dashboard/register` names an
+`owner_phone` which then receives other people's booking details, so a typo
+leaks a stranger's calendar to a stranger.
+
+With `WACAL_REQUIRE_OTP=1`, registration refuses an unverified number:
+
+```
+curl -XPOST $BASE/dashboard/verify/start   -H "x-api-key: $ADMIN_KEY" \
+     -H 'content-type: application/json' -d '{"phone":"+966500000001"}'
+curl -XPOST $BASE/dashboard/verify/confirm -H "x-api-key: $ADMIN_KEY" \
+     -H 'content-type: application/json' -d '{"phone":"+9665...","code":"123456"}'
+```
+
+Six digits, ten minutes, five attempts, one resend a minute. The code is never
+stored -- only an HMAC of it, keyed with `WACAL_OTP_PEPPER` or `WACAL_TOKEN_KEY`
+and bound to the phone number, so a row copied onto another number verifies
+nothing. The code is sent through the normal outbox, which means a number that
+has never messaged the app needs `WA_TEMPLATE_OTP` to receive it at all.
+
+## Finding your Meta ids
+
+Four values live in four places in the dashboard, and all of them are
+derivable from the access token:
+
+```
+python meta_ids.py <token>        # or set WA_TOKEN
+python meta_ids.py --env          # as a .env block
+```
+
+It prints the app id, the token type and expiry, the scopes (and which
+required ones are missing), every WABA id the token can act on, the phone
+number id for each -- that is the id in the send URL, not the phone number --
+and the templates already approved, with their status. It never prints the
+token back.
+
 ## Run the service
 
 ```
@@ -231,7 +318,7 @@ cp .env.example .env            # then fill it in
 python start.py                 # migrates, seeds a demo host, then serves
 python start.py --no-demo --reload --port 9000
 uvicorn wacal.main:app --port 8000     # or plain, no seeding
-pytest -q                       # 216 tests
+pytest -q                       # 262 tests
 python tests/mutation_check.py  # proves the guards are actually tested
 ```
 
@@ -251,12 +338,14 @@ Deliberate prototype limits, not oversights:
 - **Meta Business verification.** Required before a production number can
   message people who have not messaged you first. Days to weeks; start it
   early, it is the longest lead time in the project.
-- **Template messages.** A notification sent to the other party more than 24
-  hours after their last inbound message needs a Meta-approved template. All
-  notices here are plain text, so they only deliver inside an open window.
-- **Phone number is the identity, with no second factor.** That is Cloud API's
-  guarantee for inbound messages, but a recycled number inherits the previous
-  owner's calendar. Add a one-time code at registration.
+- **Approved template messages.** The app now sends them, and refuses rather
+  than pretending when one is missing, but the templates themselves must be
+  created and approved in an account nobody here has. Meta review is hours to
+  days per template, and a rejected one gives no delivery at all.
+- **Phone number is the identity.** That is Cloud API's guarantee for inbound
+  messages. A typed number is verified by one-time code under
+  `WACAL_REQUIRE_OTP=1`; a *recycled* number still inherits the previous
+  owner's calendar, which no code can detect.
 - **SQLite behind one process-wide lock, and that lock is the real guard.**
   `events_no_double_book` covers `(owner_id, start_utc)` only, so it catches an
   identical start but not a 09:15-09:45 booking landing inside an existing
@@ -265,8 +354,10 @@ Deliberate prototype limits, not oversights:
   would **not** be safe: move to Postgres and replace the index with
   `EXCLUDE USING gist (owner_id WITH =, tstzrange(start_utc, end_utc) WITH &&)`
   first.
-- **Google tokens are stored as plain JSON** in the `calendar_links` table.
-  Encrypt at rest before production, and treat the database file accordingly.
+- **Google tokens are encrypted at rest** with `WACAL_TOKEN_KEY` (see
+  `wacal/crypto.py` and SECURITY.md); without the key the app refuses to store
+  one. The database file is still worth treating as a secret: it holds
+  everybody's bookings in the clear.
 - **Daylight saving.** `block` refuses a time that does not exist on a
   spring-forward day, and on a fall-back day it says which of the two 01:30s
   it took and how to ask for the other. Durations are wall-clock differences,

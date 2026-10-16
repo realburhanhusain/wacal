@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import busy, db
+from . import busy, db, otp, templates
 from .gcal import ExternalCalendarError
 from .slots import parse_hhmm, schedule_for
 from .whatsapp import normalise_phone
@@ -189,6 +189,68 @@ def _host_view(conn, host) -> dict:
     }
 
 
+class PhoneIn(BaseModel):
+    phone: str = Field(min_length=6, max_length=20)
+
+    @field_validator("phone")
+    @classmethod
+    def canonical_phone(cls, value: str) -> str:
+        phone = normalise_phone(value)
+        if len(phone) < 7:
+            raise ValueError("phone needs at least 6 digits")
+        return phone
+
+
+class CodeIn(PhoneIn):
+    code: str = Field(min_length=4, max_length=10)
+
+
+@router.post("/verify/start")
+async def verify_start(payload: PhoneIn, request: Request,
+                       x_api_key: str | None = Header(default=None)):
+    """Send a one-time code to a number somebody typed in.
+
+    The code goes through the outbox like every other message, so it obeys the
+    same 24-hour window rule: a number that has never messaged this app is
+    outside its window, and reaching it needs an approved authentication
+    template in WA_TEMPLATE_OTP.
+    """
+    require_admin(x_api_key)
+    conn = request.app.state.conn
+    with db.LOCK:
+        try:
+            _code, reply = otp.start(conn, payload.phone)
+        except otp.TooSoon as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        queued = db.queue_outbound(conn, payload.phone, reply)
+
+    from .main import drain_outbox
+
+    sent = await drain_outbox(conn, request.app.state.transport, only=[queued])
+    row = conn.execute("SELECT last_error FROM outbox WHERE id = ?",
+                       (queued,)).fetchone()
+    return {
+        "phone": payload.phone,
+        "sent": bool(sent),
+        "expires_in_seconds": otp.TTL_MINUTES * 60,
+        # A code nobody can receive is the interesting case, so say why rather
+        # than reporting a send that did not happen.
+        "error": "" if sent else (row["last_error"] if row else "send failed"),
+    }
+
+
+@router.post("/verify/confirm")
+async def verify_confirm(payload: CodeIn, request: Request,
+                         x_api_key: str | None = Header(default=None)):
+    require_admin(x_api_key)
+    conn = request.app.state.conn
+    with db.LOCK:
+        verdict = otp.check(conn, payload.phone, payload.code)
+    if not verdict.ok:
+        raise HTTPException(status_code=400, detail=verdict.reason)
+    return {"phone": payload.phone, "verified": True}
+
+
 @router.post("/register", status_code=201)
 async def register(payload: HostIn, request: Request,
                    x_api_key: str | None = Header(default=None)):
@@ -197,6 +259,18 @@ async def register(payload: HostIn, request: Request,
 
     if db.get_host(conn, payload.slug) is not None:
         raise HTTPException(status_code=409, detail="slug already registered")
+
+    # owner_phone is asserted by whoever calls this route, and the owner then
+    # receives other people's booking details. A typo sends them to a
+    # stranger, so under WACAL_REQUIRE_OTP the number must prove itself first.
+    if templates.require_otp() and not db.is_phone_verified(conn,
+                                                            payload.owner_phone):
+        raise HTTPException(
+            status_code=403,
+            detail=(f"{payload.owner_phone} is not verified. POST "
+                    f"/dashboard/verify/start then /dashboard/verify/confirm, "
+                    f"or unset WACAL_REQUIRE_OTP."),
+        )
 
     owner = db.get_user_by_phone(conn, payload.owner_phone)
     if owner is None:

@@ -33,7 +33,7 @@ class LockingTransport(MemoryTransport):
         super().__init__()
         self._lock = threading.Lock()
 
-    async def send(self, to, reply):
+    async def send(self, to, reply, *, force_template=False):
         with self._lock:
             self.sent.append((to, reply))
         return {}

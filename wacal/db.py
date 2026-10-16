@@ -130,6 +130,32 @@ CREATE TABLE IF NOT EXISTS oauth_states (
     user_id    INTEGER NOT NULL REFERENCES users(id),
     created_at TEXT NOT NULL
 );
+
+-- When each number last messaged us. WhatsApp only delivers a free-form
+-- message within 24 hours of that; after it, an approved template or nothing.
+-- Keyed by phone rather than user_id because a number can be messaged before
+-- it has a user row -- an OTP to a host owner, for one.
+CREATE TABLE IF NOT EXISTS contact_window (
+    phone           TEXT PRIMARY KEY,
+    last_inbound_at TEXT NOT NULL
+);
+
+-- One live one-time code per number. The code itself is never stored; see
+-- wacal.otp. attempts is what stops a six-digit code being guessed.
+CREATE TABLE IF NOT EXISTS otp_codes (
+    phone      TEXT PRIMARY KEY,
+    code_hash  TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+-- Numbers that have proved themselves with a code. A number observed on an
+-- inbound webhook needs no proof; this is for numbers somebody typed in.
+CREATE TABLE IF NOT EXISTS verified_phones (
+    phone       TEXT PRIMARY KEY,
+    verified_at TEXT NOT NULL
+);
 """
 
 # Created after migrate(), never inside SCHEMA. An index naming a column that
@@ -718,6 +744,10 @@ def queue_outbound(conn, phone: str, reply) -> int:
         "header": reply.header,
         "rows": [{"id": row.id, "title": row.title,
                   "description": row.description} for row in reply.rows],
+        # Persisted too: a queued notification may only become deliverable
+        # hours later, by which time the window has closed and the template
+        # is the whole difference between delivery and silence.
+        "template": reply.template.to_dict() if reply.template else None,
     }, ensure_ascii=False)
     with tx(conn):
         cur = conn.execute(
@@ -731,6 +761,7 @@ def reply_from_row(row):
     """Rebuild a Reply from a queued payload."""
     import json as _json
 
+    from .templates import Template
     from .whatsapp import Reply, Row
 
     data = _json.loads(row["payload"])
@@ -740,6 +771,7 @@ def reply_from_row(row):
               for r in data.get("rows", [])],
         button=data.get("button", "Pick a slot"),
         header=data.get("header", ""),
+        template=Template.from_dict(data.get("template")),
     )
 
 
@@ -763,11 +795,118 @@ def mark_outbound_sent(conn, outbox_id: int) -> None:
                      (iso(now_utc()), outbox_id))
 
 
+REDACTED_PAYLOAD = '{"text": "(redacted)", "rows": [], "template": null}'
+
+
+def redact_outbound(conn, outbox_id: int) -> None:
+    """Drop the body of a sent message that contained a secret.
+
+    A one-time code is hashed in otp_codes but the message carrying it is a
+    queued row like any other, so the plain code sat in the outbox for the
+    seven days until prune() ran. It is no longer needed once sent.
+    """
+    with tx(conn):
+        conn.execute("UPDATE outbox SET payload = ? WHERE id = ?",
+                     (REDACTED_PAYLOAD, outbox_id))
+
+
 def record_outbound_failure(conn, outbox_id: int, error: str = "") -> None:
     with tx(conn):
         conn.execute(
             "UPDATE outbox SET attempts = attempts + 1, last_error = ?"
             " WHERE id = ?", (error[:500], outbox_id))
+
+
+# --- the 24-hour customer service window ---------------------------------
+
+WINDOW_HOURS = 24
+
+
+def touch_inbound(conn, phone: str, *, when: datetime | None = None) -> None:
+    """Record that this number just messaged us, reopening its window."""
+    if not phone:
+        return
+    stamp = iso(when or now_utc())
+    with tx(conn):
+        conn.execute(
+            "INSERT INTO contact_window (phone, last_inbound_at) VALUES (?, ?)"
+            " ON CONFLICT(phone) DO UPDATE SET last_inbound_at = excluded."
+            "last_inbound_at", (phone, stamp))
+
+
+def last_inbound(conn, phone: str) -> datetime | None:
+    row = conn.execute(
+        "SELECT last_inbound_at FROM contact_window WHERE phone = ?",
+        (phone,)).fetchone()
+    return datetime.fromisoformat(row["last_inbound_at"]) if row else None
+
+
+def within_window(conn, phone: str, *, hours: int = WINDOW_HOURS,
+                  now: datetime | None = None) -> bool:
+    """Whether a free-form message to this number would be delivered.
+
+    A number we have never heard from is outside the window, not inside it.
+    Assuming the optimistic case here is what silently dropped the first
+    message to every new contact.
+    """
+    from datetime import timedelta
+
+    seen = last_inbound(conn, phone)
+    if seen is None:
+        return False
+    return (now or now_utc()) - seen < timedelta(hours=hours)
+
+
+# --- one-time codes ------------------------------------------------------
+
+
+def put_otp(conn, phone: str, code_hash: str, expires_at: datetime) -> None:
+    """Store a challenge, replacing any live one for that number."""
+    with tx(conn):
+        conn.execute(
+            "INSERT INTO otp_codes (phone, code_hash, expires_at, attempts,"
+            " created_at) VALUES (?, ?, ?, 0, ?)"
+            " ON CONFLICT(phone) DO UPDATE SET code_hash = excluded.code_hash,"
+            " expires_at = excluded.expires_at, attempts = 0,"
+            " created_at = excluded.created_at",
+            (phone, code_hash, iso(expires_at), iso(now_utc())))
+
+
+def get_otp(conn, phone: str):
+    return conn.execute("SELECT * FROM otp_codes WHERE phone = ?",
+                        (phone,)).fetchone()
+
+
+def bump_otp_attempts(conn, phone: str) -> int:
+    with tx(conn):
+        conn.execute(
+            "UPDATE otp_codes SET attempts = attempts + 1 WHERE phone = ?",
+            (phone,))
+    row = get_otp(conn, phone)
+    return row["attempts"] if row else 0
+
+
+def clear_otp(conn, phone: str) -> None:
+    with tx(conn):
+        conn.execute("DELETE FROM otp_codes WHERE phone = ?", (phone,))
+
+
+def mark_phone_verified(conn, phone: str) -> None:
+    """Record the proof and consume the challenge, in one transaction.
+
+    Separately they can interleave with a concurrent verify of the same code.
+    """
+    with tx(conn):
+        conn.execute(
+            "INSERT INTO verified_phones (phone, verified_at) VALUES (?, ?)"
+            " ON CONFLICT(phone) DO UPDATE SET verified_at = excluded."
+            "verified_at", (phone, iso(now_utc())))
+        conn.execute("DELETE FROM otp_codes WHERE phone = ?", (phone,))
+
+
+def is_phone_verified(conn, phone: str) -> bool:
+    return conn.execute("SELECT 1 FROM verified_phones WHERE phone = ?",
+                        (phone,)).fetchone() is not None
 
 
 # --- housekeeping --------------------------------------------------------
@@ -792,5 +931,13 @@ def prune(conn, *, days: int = 7) -> dict[str, int]:
         outbox = conn.execute(
             "DELETE FROM outbox WHERE sent_at IS NOT NULL AND sent_at < ?",
             (cutoff,)).rowcount
+        otps = conn.execute("DELETE FROM otp_codes WHERE expires_at < ?",
+                            (now,)).rowcount
+        # Safe to forget: a row this old is outside the window either way, and
+        # within_window treats a missing row as outside.
+        windows = conn.execute(
+            "DELETE FROM contact_window WHERE last_inbound_at < ?",
+            (cutoff,)).rowcount
     return {"seen_messages": seen, "sessions": sessions,
-            "oauth_states": states, "outbox": outbox}
+            "oauth_states": states, "outbox": outbox, "otp_codes": otps,
+            "contact_window": windows}

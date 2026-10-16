@@ -176,7 +176,7 @@ def test_the_drainer_retries_what_a_failed_send_left_behind(client,
     conn = main.app.state.conn
     attempts = {"n": 0}
 
-    async def flaky(to, reply):
+    async def flaky(to, reply, *, force_template=False):
         attempts["n"] += 1
         if attempts["n"] == 1:
             raise RuntimeError("provider down")

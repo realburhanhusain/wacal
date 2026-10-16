@@ -18,7 +18,7 @@ import json
 import re
 from datetime import date, datetime, timedelta, timezone
 
-from . import commands, db, keywords
+from . import commands, db, keywords, templates
 from .booking import (
     Outcome,
     book,
@@ -346,13 +346,25 @@ def _confirm(conn, host, owner, user, menu, index, token, start, now,
         f"{host['location']}\n"
         f"Ref {event['ref']} · to cancel send: cancel {event['ref']}{moved}"
     ))
-    owner_note = Reply(text=(
-        f"New booking at {host['business_name']}.\n"
-        f"{user['display_name']} ({user['phone']})\n"
-        f"{service['name']} · {_money(host, service)}\n"
-        f"{fmt_dt(start, owner['timezone'])} ({owner['timezone']})\n"
-        f"Ref {event['ref']}{moved}{mirror_note}"
-    ))
+    owner_note = Reply(
+        text=(
+            f"New booking at {host['business_name']}.\n"
+            f"{user['display_name']} ({user['phone']})\n"
+            f"{service['name']} · {_money(host, service)}\n"
+            f"{fmt_dt(start, owner['timezone'])} ({owner['timezone']})\n"
+            f"Ref {event['ref']}{moved}{mirror_note}"
+        ),
+        # The owner may not have messaged the app all day, which closes the
+        # free-form window and leaves this template as the only way the
+        # booking reaches them at all. See wacal.templates.
+        template=templates.build(
+            templates.BOOKING_CONFIRMED,
+            f"{user['display_name']} ({user['phone']}) · {service['name']} "
+            f"at {host['business_name']}",
+            f"{fmt_dt(start, owner['timezone'])} ({owner['timezone']})",
+            event["ref"],
+        ),
+    )
     return Outcome(customer, notify=[(owner["phone"], owner_note)])
 
 
@@ -513,10 +525,19 @@ def _cancel(conn, host, owner, user, raw: str, now) -> Outcome:
     if other_id == user["id"]:
         return Outcome(confirm)
     other = db.get_user(conn, other_id)
-    note = Reply(text=(
-        f"{user['display_name']} cancelled {ref} at {host['business_name']} — "
-        f"{fmt_dt(start, other['timezone'])} ({other['timezone']})."
-    ))
+    note = Reply(
+        text=(
+            f"{user['display_name']} cancelled {ref} at "
+            f"{host['business_name']} — "
+            f"{fmt_dt(start, other['timezone'])} ({other['timezone']})."
+        ),
+        template=templates.build(
+            templates.BOOKING_CANCELLED,
+            f"{user['display_name']} cancelled at {host['business_name']}",
+            f"{fmt_dt(start, other['timezone'])} ({other['timezone']})",
+            ref,
+        ),
+    )
     return Outcome(confirm, notify=[(other["phone"], note)])
 
 

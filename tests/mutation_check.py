@@ -21,11 +21,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from wacal import db, slots  # noqa: E402
+from wacal import db, otp, slots, templates  # noqa: E402
 
 TESTS = Path(__file__).resolve().parent
 CONCURRENCY = str(TESTS / "test_concurrency.py")
 PROPERTIES = str(TESTS / "test_slot_properties.py")
+TEMPLATES = str(TESTS / "test_templates.py")
+OTP = str(TESTS / "test_otp.py")
 
 
 class NoLock:
@@ -72,6 +74,34 @@ def mutate_drop_lead_time() -> None:
     slots.free_slots = no_lead
 
 
+def mutate_assume_window_open() -> None:
+    """Treat every number as inside its 24-hour window."""
+    db.within_window = lambda *args, **kwargs: True
+
+
+def mutate_send_text_outside_window() -> None:
+    """Declare an undeliverable message deliverable as free-form text."""
+    templates.delivery_status = lambda **kwargs: templates.Status(True)
+
+
+def mutate_otp_never_expires() -> None:
+    original = otp.check
+
+    def forever(conn, phone, code, *, now=None):
+        row = db.get_otp(conn, phone)
+        if row is not None:
+            conn.execute("UPDATE otp_codes SET expires_at = ? WHERE phone = ?",
+                         (db.iso(db.now_utc() + timedelta(days=365)), phone))
+        return original(conn, phone, code, now=now)
+
+    otp.check = forever
+
+
+def mutate_otp_unlimited_attempts() -> None:
+    """Remove the guess cap, leaving six digits to brute force."""
+    otp.MAX_ATTEMPTS = 10 ** 6
+
+
 MUTANTS = {
     "lock": (mutate_lock, [CONCURRENCY],
              "db.LOCK no longer serialises anything"),
@@ -81,6 +111,14 @@ MUTANTS = {
                      "the working window is an hour too long"),
     "drop-lead": (mutate_drop_lead_time, [PROPERTIES],
                   "the minimum lead time is ignored"),
+    "window-open": (mutate_assume_window_open, [TEMPLATES],
+                    "every number is treated as inside its 24-hour window"),
+    "send-anyway": (mutate_send_text_outside_window, [TEMPLATES],
+                    "an undeliverable message is sent as free-form text"),
+    "otp-forever": (mutate_otp_never_expires, [OTP],
+                    "a one-time code never expires"),
+    "otp-unlimited": (mutate_otp_unlimited_attempts, [OTP],
+                      "a one-time code can be guessed without limit"),
 }
 
 
