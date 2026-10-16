@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from . import db, gcal
+from . import db, providers
 from .gcal import ExternalCalendarError
 
 
@@ -42,7 +42,7 @@ def busy_for(conn, user_id: int, start: datetime, end: datetime,
                               calendar_id=link["calendar_id"],
                               account=link["account"])
 
-    external_busy = gcal.PROVIDER.busy(
+    external_busy = providers.for_link(link).busy(
         db.token_of(link), link["calendar_id"], start, end,
         on_refresh=on_refresh,
     )
@@ -69,7 +69,7 @@ def mirror_create(conn, owner, event, *, description: str = "",
                               account=link["account"])
 
     try:
-        external_id = gcal.PROVIDER.create_event(
+        external_id = providers.for_link(link).create_event(
             db.token_of(link), link["calendar_id"],
             start=datetime.fromisoformat(event["start_utc"]),
             end=datetime.fromisoformat(event["end_utc"]),
@@ -96,7 +96,7 @@ def external_events(conn, user_id: int, start: datetime, end: datetime,
                               calendar_id=link["calendar_id"],
                               account=link["account"])
 
-    return gcal.PROVIDER.list_events(db.token_of(link), link["calendar_id"],
+    return providers.for_link(link).list_events(db.token_of(link), link["calendar_id"],
                                      start, end, limit=limit,
                                      on_refresh=on_refresh)
 
@@ -117,7 +117,7 @@ def mirror_delete(conn, event) -> bool:
                               account=link["account"])
 
     try:
-        gcal.PROVIDER.delete_event(db.token_of(link), link["calendar_id"],
+        providers.for_link(link).delete_event(db.token_of(link), link["calendar_id"],
                                    external_id, on_refresh=on_refresh)
     except ExternalCalendarError:
         return False

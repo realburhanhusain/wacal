@@ -53,6 +53,7 @@ shared                   # who can book you, and who you can book
 | `free ahmed` | Rolls forward to the next day with an opening (14 days) |
 | tap a slot | Books it, notifies the owner, returns a ref |
 | `block tomorrow 14:00-15:00 Focus` | Blocks your own time |
+| `block 2026-10-25 01:30-02:00 X +0000` | Picks a side of a repeated hour |
 | `closed 2026-12-25` | Blocks a whole working day, holidays included |
 | `my` | Upcoming bookings with their refs |
 | `cancel ABC123` | Unblocks the slot and tells the other party |
@@ -98,10 +99,10 @@ curl -X POST $BASE_URL/dashboard/register \
   }'
 ```
 
-Opening hours live on the host, not on the owner, so one person can run two
-businesses with different schedules. Any host field left null inherits the
-owner's; `GET /dashboard/{slug}` reports which applies as `schedule_source`.
-The timezone always comes from the owner -- a host has none of its own.
+Opening hours **and the timezone** live on the host, not on the owner, so one
+person can run two businesses in different cities. Any host field left null
+inherits the owner's; `GET /dashboard/{slug}` reports which applies as
+`schedule_source` and `timezone_source`.
 
 The customer conversation. On Cloud API the rows are tappable; on Twilio the
 same rows arrive numbered and the customer replies `1`, or `yes` to confirm:
@@ -230,7 +231,7 @@ cp .env.example .env            # then fill it in
 python start.py                 # migrates, seeds a demo host, then serves
 python start.py --no-demo --reload --port 9000
 uvicorn wacal.main:app --port 8000     # or plain, no seeding
-pytest -q                       # 167 tests
+pytest -q                       # 216 tests
 python tests/mutation_check.py  # proves the guards are actually tested
 ```
 
@@ -266,12 +267,14 @@ Deliberate prototype limits, not oversights:
   first.
 - **Google tokens are stored as plain JSON** in the `calendar_links` table.
   Encrypt at rest before production, and treat the database file accordingly.
-- **No rate limiting.** A valid signature can be replayed as volume.
-- **Outbound messages are queued** in `outbox` and retried on the next
-  dispatch, but nothing drains it on a timer yet, so a message that fails while
-  nobody is messaging waits for the next inbound one.
-- **One external calendar per user, Google only.** Microsoft Graph would
-  implement the same four methods in `wacal/gcal.py`.
+- **Daylight saving.** `block` refuses a time that does not exist on a
+  spring-forward day, and on a fall-back day it says which of the two 01:30s
+  it took and how to ask for the other. Durations are wall-clock differences,
+  so "01:30-02:00" is always 30 minutes.
+- **One external calendar per user, Google only.** `calendar_links.provider`
+  is read through the registry in `wacal/providers.py`, so an unsupported
+  value is an error rather than silently handed to Google. A second provider
+  needs four methods registered there, its own OAuth route, and a connect verb.
 - **No CORS.** Their reference implementation allows every origin on its admin
   API; that is not reproduced here. Add a specific allowlist if a browser
   dashboard ever needs one.

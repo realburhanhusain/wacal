@@ -101,11 +101,22 @@ class HostIn(BaseModel):
         return value
 
 
+def _known_timezone(value: str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"unknown IANA timezone {value!r}") from exc
+    return value
+
+
 class HostPatch(BaseModel):
     business_name: str | None = None
     location: str | None = None
     currency: str | None = None
     owner_email: str | None = None
+    timezone: str | None = None
     services: list[Service] | None = None
     working_days: list[int] | None = None
     working_hours: WorkingHours | None = None
@@ -120,6 +131,11 @@ class HostPatch(BaseModel):
             raise ValueError("working_days must be 0..6 with Monday=0")
         return sorted(set(value))
 
+    @field_validator("timezone")
+    @classmethod
+    def valid_timezone(cls, value: str | None) -> str | None:
+        return _known_timezone(value)
+
 
 class HostPut(BaseModel):
     """A full replacement of the editable host configuration."""
@@ -128,6 +144,7 @@ class HostPut(BaseModel):
     location: str = ""
     currency: str = "SAR"
     owner_email: str = ""
+    timezone: str | None = None
     services: list[Service] = []
     working_days: list[int] = [0, 1, 2, 3, 4]
     working_hours: WorkingHours = WorkingHours()
@@ -139,6 +156,11 @@ class HostPut(BaseModel):
         if not value or any(d < 0 or d > 6 for d in value):
             raise ValueError("working_days must be 0..6 with Monday=0")
         return sorted(set(value))
+
+    @field_validator("timezone")
+    @classmethod
+    def valid_timezone(cls, value: str | None) -> str | None:
+        return _known_timezone(value)
 
 
 def _host_view(conn, host) -> dict:
@@ -153,6 +175,7 @@ def _host_view(conn, host) -> dict:
         "owner_name": owner["display_name"] if owner else None,
         "owner_email": host["owner_email"],
         "timezone": schedule.get("timezone"),
+        "timezone_source": "host" if host["timezone"] else "owner",
         "working_hours": {"start": schedule.get("work_start"),
                           "end": schedule.get("work_end")},
         "working_days": [int(d) for d in str(schedule.get("work_days", "")).split(",")
@@ -195,8 +218,9 @@ async def register(payload: HostIn, request: Request,
         services=json.dumps([s.model_dump() for s in payload.services]),
         currency=payload.currency,
         owner_email=payload.owner_email,
-        # Opening hours are stored on the host as well, so a second business
-        # under the same owner can keep different hours.
+        timezone=payload.timezone,
+        # Opening hours and timezone are stored on the host as well, so a
+        # second business under the same owner can differ.
         work_start=payload.working_hours.start,
         work_end=payload.working_hours.end,
         work_days=",".join(str(d) for d in payload.working_days),
@@ -262,7 +286,7 @@ def _editable_fields(payload, *, partial: bool) -> dict:
     """Translate a request model into db.update_host keyword arguments."""
     fields: dict[str, object] = {}
     for name in ("business_name", "location", "currency", "owner_email",
-                 "slot_minutes"):
+                 "timezone", "slot_minutes"):
         value = getattr(payload, name, None)
         if value is not None or not partial:
             fields[name] = value

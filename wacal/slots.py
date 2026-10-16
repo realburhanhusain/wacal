@@ -25,9 +25,9 @@ def parse_hhmm(value: str) -> time:
 def schedule_for(owner, host=None) -> dict:
     """The schedule the slot engine should use.
 
-    Peer mode passes the user row alone. Business mode passes the host too: its
-    opening hours win where set, and anything left NULL inherits the owner's.
-    The timezone always comes from the owner -- a host has no separate one.
+    Peer mode passes the user row alone. Business mode passes the host too:
+    its own values win where set, and anything left NULL inherits the owner's.
+    That includes the timezone, so one owner can run businesses in two cities.
     """
     effective = {
         "id": owner["id"],
@@ -40,7 +40,8 @@ def schedule_for(owner, host=None) -> dict:
     if host is None:
         return effective
     keys = host.keys() if hasattr(host, "keys") else host
-    for field in ("work_start", "work_end", "work_days", "slot_minutes"):
+    for field in ("timezone", "work_start", "work_end", "work_days",
+                  "slot_minutes"):
         if field in keys and host[field] not in (None, ""):
             effective[field] = host[field]
     return effective
@@ -185,6 +186,44 @@ def ambiguous_day(slots: list[tuple[datetime, datetime]], zone: str) -> bool:
     z = tz_of(zone)
     offsets = {start.astimezone(z).utcoffset() for start, _ in slots}
     return len(offsets) > 1
+
+
+def is_ambiguous(day: date, moment: time, zone: str) -> bool:
+    """True when this wall-clock time happens twice on this day.
+
+    On a DST fall-back night 01:30 occurs once at +01:00 and again at +00:00.
+    Python resolves that with fold, defaulting to the first occurrence, which
+    silently makes the second hour unreachable.
+    """
+    z = tz_of(zone)
+    first = datetime.combine(day, moment, tzinfo=z)
+    second = first.replace(fold=1)
+    return first.utcoffset() != second.utcoffset()
+
+
+def is_skipped(day: date, moment: time, zone: str) -> bool:
+    """True when this wall-clock time does not exist on this day.
+
+    Spring forward: 01:30 never happens, and Python quietly maps it to a real
+    instant an hour away rather than refusing.
+    """
+    z = tz_of(zone)
+    naive = datetime.combine(day, moment)
+    aware = naive.replace(tzinfo=z)
+    # A skipped time round-trips to a different wall clock.
+    return aware.astimezone(timezone.utc).astimezone(z).replace(
+        tzinfo=None) != naive
+
+
+def to_utc(day: date, moment: time, zone: str, *, fold: int = 0) -> datetime:
+    """A local wall clock as a UTC instant, with the fold made explicit."""
+    return datetime.combine(day, moment,
+                            tzinfo=tz_of(zone)).replace(fold=fold).astimezone(
+        timezone.utc)
+
+
+def offset_label(instant: datetime, zone: str) -> str:
+    return f"{instant.astimezone(tz_of(zone)):%z}"
 
 
 def local_date(moment: datetime, zone: str) -> date:

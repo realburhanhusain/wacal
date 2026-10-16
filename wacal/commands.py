@@ -8,6 +8,7 @@ decides how to deliver them.
 from __future__ import annotations
 
 import os
+import re
 from datetime import date, datetime, timedelta, timezone
 
 from . import busy, db, gcal, keywords
@@ -28,11 +29,15 @@ from .slots import (
     ambiguous_day,
     fmt_dt,
     fmt_slot,
+    is_ambiguous,
+    is_skipped,
     local_date,
+    offset_label,
     mutual_free_slots,
     parse_day,
     parse_hhmm,
     schedule_for,
+    to_utc,
     tz_of,
     work_window,
 )
@@ -456,10 +461,50 @@ def _do_block(conn, user, rest, now) -> Outcome:
     if end_t <= start_t:
         return text("End time must be after start time.")
 
-    zone = tz_of(user["timezone"])
-    start = datetime.combine(day, start_t, tzinfo=zone).astimezone(timezone.utc)
-    end = datetime.combine(day, end_t, tzinfo=zone).astimezone(timezone.utc)
-    title = " ".join(parts[2:]) or "Busy"
+    zone_name = user["timezone"]
+    zone = tz_of(zone_name)
+    rest_words = parts[2:]
+
+    # A spring-forward gap: the time the user typed does not exist.
+    if is_skipped(day, start_t, zone_name):
+        return text(
+            f"{start_t:%H:%M} does not exist on {day:%a %d %b} in "
+            f"{zone_name} — the clocks go forward. Pick another time."
+        )
+
+    # A fall-back repetition: the time happens twice. Honour an explicit
+    # offset if given, otherwise say which one was taken and how to get the
+    # other, instead of silently making the second hour unbookable.
+    fold = 0
+    requested_offset = next(
+        (word for word in rest_words
+         if re.fullmatch(r"[+-]\d{4}", word)), None)
+    if requested_offset:
+        rest_words = [word for word in rest_words if word != requested_offset]
+
+    ambiguous = is_ambiguous(day, start_t, zone_name)
+    if ambiguous and requested_offset:
+        if offset_label(to_utc(day, start_t, zone_name, fold=1),
+                        zone_name) == requested_offset:
+            fold = 1
+        elif offset_label(to_utc(day, start_t, zone_name, fold=0),
+                          zone_name) != requested_offset:
+            return text(
+                f"{requested_offset} is not one of the two offsets in effect "
+                f"at {start_t:%H:%M} on {day:%a %d %b}."
+            )
+
+    start = to_utc(day, start_t, zone_name, fold=fold)
+    # The duration is the wall-clock difference, added to the resolved start.
+    # Converting the end time independently is wrong across a transition: on a
+    # fall-back night 02:00 is unambiguous while 01:30 is not, so "01:30-02:00"
+    # resolved to 90 real minutes instead of the 30 the user asked for.
+    duration = (datetime.combine(day, end_t)
+                - datetime.combine(day, start_t))
+    end = start + duration
+    if end <= start:
+        return text("End time must be after start time.")
+    title = " ".join(rest_words) or "Busy"
 
     try:
         overlap = busy.busy_for(conn, user["id"], start, end)
@@ -472,10 +517,24 @@ def _do_block(conn, user, rest, now) -> Outcome:
                                   description="Blocked via WhatsApp")
     except db.SlotTaken:
         return text("That slot is already blocked.")
+    note = ""
+    if ambiguous and not requested_offset:
+        other = offset_label(to_utc(day, start_t, zone_name, fold=1), zone_name)
+        note = (
+            f"\nThe clocks go back on {day:%a %d %b}, so {start_t:%H:%M} "
+            f"happens twice. This is the first one "
+            f"({offset_label(start, zone_name)}). For the other, repeat the "
+            f"command with {other} on the end."
+        )
+    # Across a fall-back the wall clock can run backwards ("01:30-01:00"),
+    # which is right but unreadable without the offsets.
+    marks = (f" {offset_label(start, zone_name)}",
+             f" {offset_label(end, zone_name)}") if ambiguous else ("", "")
     return text(
-        f"Blocked {fmt_dt(start, user['timezone'])}-"
-        f"{end.astimezone(zone):%H:%M} — {title}\n"
-        f"Ref {event['ref']} · unblock with: cancel {event['ref']}{mirror_note}"
+        f"Blocked {fmt_dt(start, zone_name)}{marks[0]}-"
+        f"{end.astimezone(zone):%H:%M}{marks[1]} — {title}\n"
+        f"Ref {event['ref']} · unblock with: cancel {event['ref']}"
+        f"{mirror_note}{note}"
     )
 
 

@@ -83,6 +83,9 @@ CREATE TABLE IF NOT EXISTS hosts (
     currency      TEXT NOT NULL DEFAULT 'SAR',
     created_at    TEXT NOT NULL,
     owner_email   TEXT NOT NULL DEFAULT '',
+    -- NULL inherits the owner's, like the hours below. Set it when one owner
+    -- runs businesses in two cities.
+    timezone      TEXT,
     work_start    TEXT,
     work_end      TEXT,
     work_days     TEXT,
@@ -209,6 +212,7 @@ ADDED_COLUMNS = {
     ],
     "hosts": [
         ("owner_email", "TEXT NOT NULL DEFAULT ''"),
+        ("timezone", "TEXT"),
         ("work_start", "TEXT"),
         ("work_end", "TEXT"),
         ("work_days", "TEXT"),
@@ -550,26 +554,27 @@ def hosts_of(conn, owner_id: int):
 def create_host(conn, slug: str, owner_id: int, business_name: str, *,
                 location: str = "", services: str = "[]",
                 currency: str = "SAR", owner_email: str = "",
+                timezone: str | None = None,
                 work_start: str | None = None, work_end: str | None = None,
                 work_days: str | None = None,
                 slot_minutes: int | None = None):
     with tx(conn):
         conn.execute(
             "INSERT INTO hosts (slug, owner_id, business_name, location,"
-            " services, currency, created_at, owner_email, work_start,"
-            " work_end, work_days, slot_minutes)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " services, currency, created_at, owner_email, timezone,"
+            " work_start, work_end, work_days, slot_minutes)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (slug.lower(), owner_id, business_name, location, services,
-             currency, iso(now_utc()), owner_email, work_start, work_end,
-             work_days, slot_minutes),
+             currency, iso(now_utc()), owner_email, timezone, work_start,
+             work_end, work_days, slot_minutes),
         )
     return get_host(conn, slug)
 
 
 def update_host(conn, slug: str, **fields):
     allowed = {"business_name", "location", "services", "currency",
-               "owner_email", "work_start", "work_end", "work_days",
-               "slot_minutes"}
+               "owner_email", "timezone", "work_start", "work_end",
+               "work_days", "slot_minutes"}
     bad = set(fields) - allowed
     if bad:
         raise ValueError(f"cannot update {sorted(bad)}")
