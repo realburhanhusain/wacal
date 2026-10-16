@@ -43,7 +43,7 @@ def busy_for(conn, user_id: int, start: datetime, end: datetime,
                               account=link["account"])
 
     external_busy = gcal.PROVIDER.busy(
-        link["token_json"], link["calendar_id"], start, end,
+        db.token_of(link), link["calendar_id"], start, end,
         on_refresh=on_refresh,
     )
     intervals.extend((_norm(s), _norm(e)) for s, e in external_busy)
@@ -70,7 +70,7 @@ def mirror_create(conn, owner, event, *, description: str = "",
 
     try:
         external_id = gcal.PROVIDER.create_event(
-            link["token_json"], link["calendar_id"],
+            db.token_of(link), link["calendar_id"],
             start=datetime.fromisoformat(event["start_utc"]),
             end=datetime.fromisoformat(event["end_utc"]),
             title=event["title"], description=description, location=location,
@@ -96,7 +96,7 @@ def external_events(conn, user_id: int, start: datetime, end: datetime,
                               calendar_id=link["calendar_id"],
                               account=link["account"])
 
-    return gcal.PROVIDER.list_events(link["token_json"], link["calendar_id"],
+    return gcal.PROVIDER.list_events(db.token_of(link), link["calendar_id"],
                                      start, end, limit=limit,
                                      on_refresh=on_refresh)
 
@@ -117,7 +117,7 @@ def mirror_delete(conn, event) -> bool:
                               account=link["account"])
 
     try:
-        gcal.PROVIDER.delete_event(link["token_json"], link["calendar_id"],
+        gcal.PROVIDER.delete_event(db.token_of(link), link["calendar_id"],
                                    external_id, on_refresh=on_refresh)
     except ExternalCalendarError:
         return False

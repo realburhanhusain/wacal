@@ -53,14 +53,36 @@ one-time code at registration before trusting this with anything sensitive.
 - `/dashboard/*` answers 503 when `ADMIN_KEY` is unset, never open.
 - Verify-token and API-key comparisons use `hmac.compare_digest`.
 
+## Calendar tokens are encrypted at rest
+
+A Google refresh token is a standing grant to read and write someone's
+calendar. They are stored as `enc:v1:<fernet token>` using `WACAL_TOKEN_KEY`
+(`python -m wacal.crypto` prints a key).
+
+- Storing a token with no key configured is **refused**, not silently done in
+  the clear. `WACAL_ALLOW_PLAINTEXT_TOKENS=1` overrides that for local work.
+- Rows written before encryption existed still read, and re-encrypt on their
+  next save.
+- A key that no longer matches raises rather than returning nonsense; affected
+  users must send `connect google` again.
+- Read tokens through `db.token_of(link)`, never `link["token_json"]`.
+
+## One writer process per database
+
+The double-booking guard is an in-process lock plus a re-check plus a partial
+unique index on `(owner_id, start_utc)`. The index alone does not catch an
+overlapping booking with a different start time, which variable service
+durations produce routinely — so `uvicorn --workers 4` is not slower, it is
+wrong.
+
+Startup therefore takes an exclusive advisory lock on
+`<database>.writer.lock`, and a second process fails loudly. The holder's pid
+is written to `<database>.writer.pid` for whoever has to look. Set
+`WACAL_ALLOW_MULTIPROCESS=1` only once writes are guarded across processes,
+e.g. by a Postgres `EXCLUDE USING gist` constraint.
+
 ## Still outstanding
 
-- Google refresh tokens are stored as plain JSON in `calendar_links`. Encrypt
-  at rest before production, and treat the database file as a secret.
 - No rate limiting. A valid signature can be replayed as volume.
-- Single process, single SQLite lock. The double-booking guard is that lock
-  plus a re-check plus a partial unique index on `(owner_id, start_utc)`; the
-  index alone does not catch overlapping events with different start times, so
-  multiple workers would need a Postgres range exclusion constraint instead.
 
 Report anything found here by opening an issue.

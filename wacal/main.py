@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from starlette.concurrency import run_in_threadpool
 
-from . import db, gcal, numbering
+from . import db, gcal, numbering, singleton
 from .auth import router as auth_router
 from .business import handle_business
 from .commands import handle
@@ -47,14 +47,22 @@ async def lifespan(application: FastAPI):
     The dashboard and auth routers read app.state.conn directly, so a lazy
     connection opened only by the webhook route would leave them with None.
     """
+    writer_lock = None
     if getattr(application.state, "conn", None) is None:
+        # One writer per database: the booking guard is in-process, so a
+        # second worker could double book. See wacal.singleton.
+        writer_lock = singleton.guard(db.DEFAULT_DB)
         application.state.conn = db.connect()
     if getattr(application.state, "transport", None) is None:
         application.state.transport = build_transport()
     removed = db.prune(application.state.conn)
     if any(removed.values()):
         logger.info("pruned %s", removed)
-    yield
+    try:
+        yield
+    finally:
+        if writer_lock is not None:
+            writer_lock.release()
 
 
 logger = logging.getLogger("wacal")

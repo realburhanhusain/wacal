@@ -96,11 +96,17 @@ def test_failed_mirror_keeps_the_booking_and_warns_the_owner(conn, linked,
 
 
 def test_refreshed_token_is_persisted(conn, linked, fake_google):
+    from wacal import crypto
+
     owner, _ = linked
     fake_google.refresh_to = '{"token": "refreshed"}'
     say(conn, GUEST, f"free {OWNER} today")
-    assert db.get_calendar_link(conn, owner["id"])["token_json"] == \
-        '{"token": "refreshed"}'
+
+    link = db.get_calendar_link(conn, owner["id"])
+    assert db.token_of(link) == '{"token": "refreshed"}'
+    # And it is not sitting in the database in the clear.
+    assert crypto.is_encrypted(link["token_json"])
+    assert "refreshed" not in link["token_json"]
 
 
 def test_blocking_own_time_respects_google(conn, people, fake_google):

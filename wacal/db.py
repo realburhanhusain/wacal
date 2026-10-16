@@ -496,9 +496,25 @@ def get_calendar_link(conn, user_id: int):
     ).fetchone()
 
 
+def token_of(link) -> str:
+    """The decrypted token for a calendar_links row.
+
+    Always read a token through this, never link["token_json"] directly: the
+    column holds ciphertext whenever WACAL_TOKEN_KEY is set.
+    """
+    from . import crypto
+
+    return crypto.decrypt(link["token_json"])
+
+
 def save_calendar_link(conn, user_id: int, token_json: str, *,
                        provider: str = "google", calendar_id: str = "primary",
                        account: str = ""):
+    from . import crypto
+
+    # A refresh token is a standing grant over someone's calendar, so it is
+    # encrypted before it reaches the database file.
+    token_json = crypto.encrypt(token_json)
     with tx(conn):
         conn.execute(
             "INSERT INTO calendar_links (user_id, provider, calendar_id,"

@@ -7,3 +7,6 @@ __pycache__/
 .hypothesis/
 tests/legacy.db*
 tests/race.db*
+*.writer.lock
+*.writer.pid
+tests/guard.db*

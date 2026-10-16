@@ -70,9 +70,12 @@ class FakeGoogle:
 
 
 @pytest.fixture(autouse=True)
-def state_secret(monkeypatch):
-    """gcal refuses to sign a state token without a configured secret."""
+def secrets_configured(monkeypatch):
+    """The app refuses to sign states or store tokens without keys."""
+    from wacal import crypto
+
     monkeypatch.setenv("WACAL_STATE_SECRET", "test-state-secret")
+    monkeypatch.setenv("WACAL_TOKEN_KEY", crypto.generate_key())
 
 
 @pytest.fixture()
