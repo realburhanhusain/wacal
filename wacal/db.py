@@ -166,7 +166,13 @@ def new_ref() -> str:
 LOCK = threading.RLock()
 
 
-def connect(path: Path | str | None = None) -> sqlite3.Connection:
+def connect(path: Path | str | None = None, *,
+            on_migrate=None) -> sqlite3.Connection:
+    """Open the database, applying any pending migrations.
+
+    on_migrate receives the list of steps applied, so a caller can report an
+    upgrade without calling migrate() a second time and always seeing nothing.
+    """
     target = Path(path) if path else DEFAULT_DB
     if target != Path(":memory:"):
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -175,7 +181,9 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
-    migrate(conn)
+    applied = migrate(conn)
+    if on_migrate is not None:
+        on_migrate(applied)
     return conn
 
 

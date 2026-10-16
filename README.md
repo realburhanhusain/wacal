@@ -255,9 +255,14 @@ Deliberate prototype limits, not oversights:
 - **Phone number is the identity, with no second factor.** That is Cloud API's
   guarantee for inbound messages, but a recycled number inherits the previous
   owner's calendar. Add a one-time code at registration.
-- **SQLite behind one lock.** Correct, but caps throughput. Move to Postgres
-  and swap the lock for `SELECT ... FOR UPDATE`; the `events_no_double_book`
-  unique index is what actually prevents double booking and ports directly.
+- **SQLite behind one process-wide lock, and that lock is the real guard.**
+  `events_no_double_book` covers `(owner_id, start_utc)` only, so it catches an
+  identical start but not a 09:15-09:45 booking landing inside an existing
+  09:00-10:00 one — which variable service durations produce. In one process
+  the lock plus the re-check before insert covers that. `uvicorn --workers N`
+  would **not** be safe: move to Postgres and replace the index with
+  `EXCLUDE USING gist (owner_id WITH =, tstzrange(start_utc, end_utc) WITH &&)`
+  first.
 - **Google tokens are stored as plain JSON** in the `calendar_links` table.
   Encrypt at rest before production, and treat the database file accordingly.
 - **No rate limiting.** A valid signature can be replayed as volume.

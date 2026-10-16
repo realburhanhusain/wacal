@@ -51,11 +51,16 @@ def main() -> int:
     parser.add_argument("--no-demo", action="store_true")
     args = parser.parse_args()
 
-    conn = db.connect()
-    applied = db.migrate(conn)
+    # db.connect() already migrates, so report what it did rather than calling
+    # migrate() again and always printing an empty list.
+    applied: list[str] = []
+    conn = db.connect(on_migrate=applied.extend)
     print(f"Database ready at {db.DEFAULT_DB}")
     if applied:
         print(f"Applied migrations: {', '.join(applied)}")
+    pruned = db.prune(conn)
+    if any(pruned.values()):
+        print(f"Pruned: {pruned}")
     if not args.no_demo:
         seed(conn)
     conn.close()
