@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
-from hypothesis import HealthCheck, assume, given, settings
+from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from wacal.slots import (
@@ -55,6 +55,30 @@ days_strategy = st.lists(st.integers(0, 6), min_size=1, max_size=7,
                          unique=True).map(
     lambda ds: ",".join(str(d) for d in sorted(ds)))
 dates = st.dates(min_value=date(2026, 1, 1), max_value=date(2027, 12, 31))
+all_days = "0,1,2,3,4,5,6"
+
+
+@st.composite
+def productive_schedules(draw):
+    """A schedule that actually yields at least two slots on any day.
+
+    Drawing start and end independently produces end <= start most of the
+    time, and a schedule with no window yields no slots. Filtering those out
+    with assume() made hypothesis raise FailedHealthCheck on roughly one run
+    in three -- an intermittent failure with no counterexample, which looks
+    exactly like a real flake. Construct the window instead.
+    """
+    zone = draw(st.sampled_from(ZONES))
+    slot_minutes = draw(slot_sizes)
+    # Leave room for at least two slots, and keep the window inside one day.
+    span = draw(st.integers(min_value=2 * slot_minutes,
+                            max_value=max(2 * slot_minutes, 600)))
+    start_minute = draw(st.integers(min_value=0,
+                                    max_value=max(0, 1439 - span)))
+    start = time(start_minute // 60, start_minute % 60)
+    end_minute = start_minute + span
+    end = time(end_minute // 60, end_minute % 60)
+    return make_schedule(zone, start, end, all_days, slot_minutes)
 
 
 @given(zone=st.sampled_from(ZONES), start=times, end=times, days=days_strategy,
@@ -77,18 +101,16 @@ def test_every_slot_lies_inside_the_working_window(zone, start, end, days,
         assert slot_end - slot_start == timedelta(minutes=slot_minutes)
 
 
-@given(zone=st.sampled_from(ZONES), start=times, end=times, days=days_strategy,
-       slot_minutes=slot_sizes, day=dates)
+@given(schedule=productive_schedules(), day=dates)
 @SETTINGS
-def test_slots_are_aligned_and_never_overlap_each_other(zone, start, end, days,
-                                                        slot_minutes, day):
-    schedule = make_schedule(zone, start, end, days, slot_minutes)
+def test_slots_are_aligned_and_never_overlap_each_other(schedule, day):
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     slots = free_slots(schedule, day, [], now=now)
-    assume(slots)
+    if not slots:
+        return
 
     window_start = work_window(schedule, day)[0]
-    size = timedelta(minutes=slot_minutes)
+    size = timedelta(minutes=schedule["slot_minutes"])
     for index, (slot_start, slot_end) in enumerate(slots):
         offset = slot_start - window_start
         assert offset % size == timedelta(0), "slot off the grid"
@@ -134,16 +156,14 @@ def test_no_slot_overlaps_a_busy_interval(zone, start, end, days, slot_minutes,
             assert not (slot_start < busy_end and slot_end > busy_start)
 
 
-@given(zone=st.sampled_from(ZONES), start=times, end=times, days=days_strategy,
-       slot_minutes=slot_sizes, day=dates)
+@given(schedule=productive_schedules(), day=dates)
 @SETTINGS
-def test_booking_a_slot_removes_exactly_that_slot(zone, start, end, days,
-                                                  slot_minutes, day):
+def test_booking_a_slot_removes_exactly_that_slot(schedule, day):
     """The round trip the whole app depends on."""
-    schedule = make_schedule(zone, start, end, days, slot_minutes)
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     slots = free_slots(schedule, day, [], now=now)
-    assume(len(slots) >= 2)
+    if len(slots) < 2:
+        return
 
     taken = slots[len(slots) // 2]
     busy = [(taken[0].isoformat(), taken[1].isoformat())]
@@ -191,10 +211,11 @@ def test_slot_labels_are_unique_once_the_offset_is_shown(day, zone):
     """A DST fall-back day repeats a wall clock; the offset disambiguates."""
     from wacal.slots import ambiguous_day, fmt_slot
 
-    schedule = make_schedule(zone, time(0, 0), time(23, 30), "0,1,2,3,4,5,6", 30)
+    schedule = make_schedule(zone, time(0, 0), time(23, 30), all_days, 30)
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     slots = free_slots(schedule, day, [], now=now)
-    assume(slots)
+    if not slots:
+        return
 
     show_offset = ambiguous_day(slots, zone)
     labels = [fmt_slot(s, e, zone, show_offset=show_offset) for s, e in slots]

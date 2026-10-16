@@ -4,3 +4,6 @@
 *.db-shm
 __pycache__/
 .pytest_cache/
+.hypothesis/
+tests/legacy.db*
+tests/race.db*

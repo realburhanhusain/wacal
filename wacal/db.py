@@ -89,19 +89,6 @@ CREATE TABLE IF NOT EXISTS hosts (
     slot_minutes  INTEGER
 );
 
--- Stops a double-tapped WhatsApp button from creating two identical bookings.
-CREATE UNIQUE INDEX IF NOT EXISTS events_no_double_book
-    ON events(owner_id, start_utc) WHERE status = 'confirmed';
-
-CREATE INDEX IF NOT EXISTS events_by_owner_window
-    ON events(owner_id, start_utc, end_utc);
-
-CREATE INDEX IF NOT EXISTS events_by_host
-    ON events(host_slug, start_utc);
-
-CREATE INDEX IF NOT EXISTS events_by_booker
-    ON events(created_by, end_utc);
-
 -- Meta retries a webhook until it gets a 200, so the same message id can
 -- arrive several times. Seen ids are rejected before any booking happens.
 CREATE TABLE IF NOT EXISTS seen_messages (
@@ -133,8 +120,6 @@ CREATE TABLE IF NOT EXISTS outbox (
     sent_at    TEXT
 );
 
-CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(sent_at, id);
-
 -- OAuth state tokens are single use. Without this a replayed or forged state
 -- lets someone attach their own Google account to another user's row.
 CREATE TABLE IF NOT EXISTS oauth_states (
@@ -142,6 +127,26 @@ CREATE TABLE IF NOT EXISTS oauth_states (
     user_id    INTEGER NOT NULL REFERENCES users(id),
     created_at TEXT NOT NULL
 );
+"""
+
+# Created after migrate(), never inside SCHEMA. An index naming a column that
+# an older database has not gained yet makes executescript fail, which locked
+# every pre-0.3 database out of the app entirely.
+INDEXES = """
+-- Stops a double-tapped WhatsApp button from creating two identical bookings.
+CREATE UNIQUE INDEX IF NOT EXISTS events_no_double_book
+    ON events(owner_id, start_utc) WHERE status = 'confirmed';
+
+CREATE INDEX IF NOT EXISTS events_by_owner_window
+    ON events(owner_id, start_utc, end_utc);
+
+CREATE INDEX IF NOT EXISTS events_by_host
+    ON events(host_slug, start_utc);
+
+CREATE INDEX IF NOT EXISTS events_by_booker
+    ON events(created_by, end_utc);
+
+CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(sent_at, id);
 """
 
 REF_ALPHABET = string.ascii_uppercase + string.digits
@@ -185,8 +190,10 @@ def connect(path: Path | str | None = None, *,
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    # Order matters: tables, then the column migrations, then the indexes.
     conn.executescript(SCHEMA)
     applied = migrate(conn)
+    conn.executescript(INDEXES)
     if on_migrate is not None:
         on_migrate(applied)
     return conn
