@@ -163,6 +163,11 @@ def new_ref() -> str:
 # One process-wide connection is shared across request threads, so every
 # statement is serialised through this lock. Use LOCK around a read-then-write
 # sequence too, or two requests can both see a slot as free. See main.py.
+#
+# It is load-bearing twice over: without it, concurrent writers on one
+# connection also raise "cannot start a transaction within a transaction",
+# because tx() issues BEGIN IMMEDIATE on a connection another thread has
+# already opened a transaction on. tests/mutation_check.py demonstrates both.
 LOCK = threading.RLock()
 
 
