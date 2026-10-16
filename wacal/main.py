@@ -16,6 +16,7 @@ provider: Meta needs WA_VERIFY_TOKEN on the GET handshake, Twilio needs its
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -27,7 +28,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from starlette.concurrency import run_in_threadpool
 
-from . import db, gcal, numbering, singleton
+from . import db, gcal, numbering, ratelimit, singleton
 from .auth import router as auth_router
 from .business import handle_business
 from .commands import handle
@@ -58,14 +59,39 @@ async def lifespan(application: FastAPI):
     removed = db.prune(application.state.conn)
     if any(removed.values()):
         logger.info("pruned %s", removed)
+    drainer = asyncio.create_task(
+        _drain_forever(application.state.conn, application.state.transport))
     try:
         yield
     finally:
+        drainer.cancel()
+        try:
+            await drainer
+        except asyncio.CancelledError:
+            pass
         if writer_lock is not None:
             writer_lock.release()
 
 
 logger = logging.getLogger("wacal")
+
+# How often to retry whatever is still sitting in the outbox. Replies are sent
+# immediately; this only exists so a message that failed while nobody was
+# texting does not wait for the next inbound one.
+DRAIN_SECONDS = max(5, int(os.environ.get("WACAL_DRAIN_SECONDS", "60") or 60))
+
+
+async def _drain_forever(database, sender) -> None:
+    while True:
+        try:
+            await asyncio.sleep(DRAIN_SECONDS)
+            sent = await drain_outbox(database, sender)
+            if sent:
+                logger.info("outbox drained %s message(s)", sent)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a background task must not die
+            logger.exception("outbox drain failed")
 
 app = FastAPI(title="wacal", version="0.4.0", lifespan=lifespan)
 app.include_router(auth_router)
@@ -77,6 +103,8 @@ TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 
 app.state.conn = None
 app.state.transport = None
+# One process only (see wacal.singleton), so in-memory counters are correct.
+limiter = ratelimit.from_environment()
 
 
 def conn():
@@ -170,6 +198,17 @@ def _handle_one(database, host, host_slug: str | None, message,
     with db.LOCK:
         if db.already_seen(database, message.message_id):
             return []
+
+        refusal = limiter.check(message.from_phone)
+        if refusal is not None:
+            # Mark it seen either way: a throttled message must not be
+            # redelivered forever by the provider.
+            db.mark_seen(database, message.message_id)
+            logger.warning("rate limited %s", message.from_phone)
+            if not refusal:
+                return []
+            return [db.queue_outbound(database, message.from_phone,
+                                      _refusal_reply(refusal))]
         # A typed number stands in for a tapped row; see wacal.numbering.
         message = numbering.resolve(database, message, scope)
         try:
@@ -265,6 +304,12 @@ def _unknown_host():
     from .booking import text
 
     return text("This booking link is not active.")
+
+
+def _refusal_reply(reason: str):
+    from .whatsapp import Reply
+
+    return Reply(text=reason)
 
 
 @app.get("/")

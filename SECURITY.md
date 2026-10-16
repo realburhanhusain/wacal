@@ -81,8 +81,24 @@ is written to `<database>.writer.pid` for whoever has to look. Set
 `WACAL_ALLOW_MULTIPROCESS=1` only once writes are guarded across processes,
 e.g. by a Postgres `EXCLUDE USING gist` constraint.
 
+## Rate limiting
+
+A valid signature is not a promise of good behaviour, and every message costs a
+booking pass plus possibly a Google round trip, all behind one process-wide
+lock — so one sender can stall everyone.
+
+Two sliding windows per sender, a burst and a sustained one, both configurable
+and generous by default. A throttled sender gets **one** explanation and is
+then dropped silently, because replying to every message of a flood is itself
+a flood. Throttled messages are still marked seen so the provider stops
+redelivering them, and one sender's block never affects another's.
+
+In-memory state, which is correct because the app refuses to run as more than
+one process.
+
 ## Still outstanding
 
-- No rate limiting. A valid signature can be replayed as volume.
+- Nothing from the two reviews. See the README for the deliberate product
+  limits that remain (templates, OTP at registration, payments).
 
 Report anything found here by opening an issue.

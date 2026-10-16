@@ -78,6 +78,16 @@ def secrets_configured(monkeypatch):
     monkeypatch.setenv("WACAL_TOKEN_KEY", crypto.generate_key())
 
 
+@pytest.fixture(autouse=True)
+def fresh_rate_limiter():
+    """The limiter is module state, so it would leak between tests."""
+    from wacal import main
+
+    main.limiter.reset()
+    yield
+    main.limiter.reset()
+
+
 @pytest.fixture()
 def conn():
     connection = db.connect(":memory:")
