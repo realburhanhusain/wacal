@@ -230,7 +230,8 @@ cp .env.example .env            # then fill it in
 python start.py                 # migrates, seeds a demo host, then serves
 python start.py --no-demo --reload --port 9000
 uvicorn wacal.main:app --port 8000     # or plain, no seeding
-pytest -q                       # 151 tests
+pytest -q                       # 167 tests
+python tests/mutation_check.py  # proves the guards are actually tested
 ```
 
 Expose port 8000 with `ngrok http 8000` or `cloudflared tunnel`. In the Meta

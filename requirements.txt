@@ -5,6 +5,7 @@ pydantic>=2.7
 python-multipart>=0.0.9
 pytest>=8.0
 pytest-timeout>=2.3
+hypothesis>=6.100
 tzdata>=2024.1 ; sys_platform == "win32"
 
 # Google Calendar integration. Needed only if any user runs "connect google";
