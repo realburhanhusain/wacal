@@ -7,6 +7,12 @@ paste the token and read the answer:
     python meta_ids.py                 # reads WA_TOKEN
     python meta_ids.py <token>
     python meta_ids.py --env           # print as a .env block
+    python meta_ids.py --waba <id>     # when discovery finds nothing
+
+A token issued from the app dashboard's "temporary access token" box often
+carries no target ids in its granular scopes and belongs to no business
+portfolio, so neither discovery path finds the WABA even though the token can
+use it. Pass --waba with the id from WhatsApp > API Setup in that case.
 
 What it reports:
 
@@ -114,7 +120,8 @@ def message_templates(waba_id: str, token: str) -> list[dict]:
                fields="name,status,category,language", limit=50).get("data", [])
 
 
-def report(token: str, as_env: bool = False) -> int:
+def report(token: str, as_env: bool = False,
+           given: list[str] | None = None) -> int:
     info = debug(token)
     if not info.get("is_valid"):
         print("This token is not valid. Generate a new one in the Meta app "
@@ -124,7 +131,9 @@ def report(token: str, as_env: bool = False) -> int:
     app_id = str(info.get("app_id", ""))
     expires = info.get("expires_at", 0)
     scopes = info.get("scopes", []) or []
-    accounts = waba_ids(info, token)
+    # An explicit --waba wins: a token can be entitled to an account that
+    # neither its granular scopes nor any business portfolio lists.
+    accounts = list(given or []) or waba_ids(info, token)
 
     lines: list[str] = []
     if not as_env:
@@ -139,10 +148,11 @@ def report(token: str, as_env: bool = False) -> int:
         for scope in missing:
             print(f"  MISSING {scope} -- needed to {NEEDED[scope]}")
         if not accounts:
-            print("\nNo WhatsApp Business Account is reachable with this "
-                  "token. In the app dashboard, add the WhatsApp product, "
-                  "then re-generate the token with whatsapp_business_"
-                  "management granted.")
+            print("\nNo WhatsApp Business Account was discoverable from this "
+                  "token -- which is normal for a temporary dashboard token, "
+                  "and does not mean it cannot use one. Pass the id from "
+                  "WhatsApp > API Setup:\n    python meta_ids.py --waba "
+                  "<waba id>")
             return 1
 
     for waba_id in accounts:
@@ -181,15 +191,29 @@ def report(token: str, as_env: bool = False) -> int:
 
 
 def main(argv: list[str]) -> int:
-    args = [a for a in argv[1:] if a != "--env"]
-    as_env = "--env" in argv[1:]
+    raw = argv[1:]
+    as_env = "--env" in raw
+    given: list[str] = []
+    args: list[str] = []
+    expect_waba = False
+    for item in raw:
+        if expect_waba:
+            given.append(item)
+            expect_waba = False
+        elif item == "--waba":
+            expect_waba = True
+        elif item != "--env":
+            args.append(item)
+    if expect_waba:
+        print("--waba needs an id")
+        return 2
     token = (args[0] if args else os.environ.get("WA_TOKEN", "")).strip()
     if not token:
         print(__doc__)
         print("No token given and WA_TOKEN is not set.")
         return 2
     try:
-        return report(token, as_env=as_env)
+        return report(token, as_env=as_env, given=given)
     except MetaError as exc:
         # The token is deliberately absent from this message.
         print(f"Meta refused the request: {exc}")
